@@ -220,6 +220,8 @@ static struct sr_key_info sr_key_info_config[] = {
 		"Over-current protection delay", NULL},
 	{SR_CONF_INVERTED, SR_T_BOOL, "inverted",
 		"Signal inverted", NULL},
+	{SR_CONF_TRIGGER_SWEEP, SR_T_STRING, "triggersweep",
+		"Trigger sweep", NULL},
 
 	/* Special stuff */
 	{SR_CONF_SESSIONFILE, SR_T_STRING, "sessionfile",
