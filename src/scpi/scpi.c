@@ -82,6 +82,7 @@ SR_PRIV extern const struct sr_scpi_dev_inst scpi_serial_dev;
 SR_PRIV extern const struct sr_scpi_dev_inst scpi_tcp_raw_dev;
 SR_PRIV extern const struct sr_scpi_dev_inst scpi_tcp_rigol_dev;
 SR_PRIV extern const struct sr_scpi_dev_inst scpi_usbtmc_libusb_dev;
+SR_PRIV extern const struct sr_scpi_dev_inst scpi_usb_vs5000_dev;
 SR_PRIV extern const struct sr_scpi_dev_inst scpi_vxi_dev;
 SR_PRIV extern const struct sr_scpi_dev_inst scpi_visa_dev;
 SR_PRIV extern const struct sr_scpi_dev_inst scpi_libgpib_dev;
@@ -91,6 +92,7 @@ static const struct sr_scpi_dev_inst *scpi_devs[] = {
 	&scpi_tcp_rigol_dev,
 #ifdef HAVE_LIBUSB_1_0
 	&scpi_usbtmc_libusb_dev,
+	&scpi_usb_vs5000_dev,
 #endif
 #if HAVE_RPC
 	&scpi_vxi_dev,

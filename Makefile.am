@@ -163,7 +163,8 @@ if NEED_USB
 libsigrok_la_SOURCES += \
 	src/ezusb.c \
 	src/usb.c \
-	src/scpi/scpi_usbtmc_libusb.c
+	src/scpi/scpi_usbtmc_libusb.c \
+	src/scpi/scpi_usb_vs5000.c
 endif
 if NEED_VISA
 libsigrok_la_SOURCES += \

@@ -73,6 +73,7 @@ enum scpi_transport_layer {
 	SCPI_TRANSPORT_USBTMC,
 	SCPI_TRANSPORT_VISA,
 	SCPI_TRANSPORT_VXI,
+	SCPI_TRANSPORT_USB_VS5000,
 };
 
 struct scpi_command {
