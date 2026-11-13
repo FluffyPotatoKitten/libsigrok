@@ -188,7 +188,13 @@ static int init(struct sr_output *o, GHashTable *options)
 		* (ctx->num_analog_channels + ctx->num_logic_channels));
 
 	/* Once more to map the enabled channels. */
-	ctx->channel_count = g_slist_length(o->sdi->channels);
+	/*
+	 * Channels per set of samples: each enabled analog channel comes in
+	 * its own packet, a logic packet carries all logic channels (see
+	 * process_logic()). Disabled channels never arrive.
+	 */
+	ctx->channel_count = ctx->num_analog_channels +
+		(ctx->num_logic_channels ? ctx->logic_channel_count : 0);
 	for (i = 0, l = o->sdi->channels; l; l = l->next) {
 		ch = l->data;
 		if (ch->enabled) {
