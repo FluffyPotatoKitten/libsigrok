@@ -127,6 +127,9 @@ static int receive(const struct sr_output *o, const struct sr_datafeed_packet *p
 		break;
 	case SR_DF_ANALOG:
 		analog = packet->payload;
+		/* g_try_realloc(p, 0) frees p and returns NULL. */
+		if (!analog->num_samples)
+			break;
 		num_channels = g_slist_length(analog->meaning->channels);
 		if (!(fdata = g_try_realloc(ctx->fdata,
 						analog->num_samples * num_channels * sizeof(float))))
