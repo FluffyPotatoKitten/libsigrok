@@ -19,10 +19,22 @@
 
 #include "config.h"
 
+#if defined _WIN32
+#define _WIN32_WINNT 0x0501
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include <errno.h>
 #include <glib.h>
 #include <libsigrok/libsigrok.h>
 #include <string.h>
+
+#if !defined _WIN32
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 
 #include "libsigrok-internal.h"
 #include "scpi.h"
@@ -104,7 +116,7 @@ static int scpi_tcp_source_remove(struct sr_session *session, void *priv)
 	return sr_tcp_source_remove(session, tcp->tcp_dev);
 }
 
-/* Transmit text, usually a command. tcp-raw and tcp-rigol modes. */
+/* Transmit text, usually a command. tcp-raw mode. */
 static int scpi_tcp_send(void *priv, const char *command)
 {
 	struct scpi_tcp *tcp = priv;
@@ -126,6 +138,69 @@ static int scpi_tcp_send(void *priv, const char *command)
 	}
 
 	sr_spew("Successfully sent SCPI command: '%s'.", command);
+
+	return SR_OK;
+}
+
+/*
+ * Open the connection, tcp-rigol mode.
+ *
+ * The Rigol VS5000 firmware treats every received TCP segment as exactly
+ * one command. Two commands in one segment, or one command split across
+ * segments, are silently ignored. Disable Nagle's algorithm so that small
+ * writes are not held back and coalesced with the next command.
+ */
+static int scpi_tcp_rigol_open(struct sr_scpi_dev_inst *scpi)
+{
+	struct scpi_tcp *tcp = scpi->priv;
+	int ret, one;
+
+	ret = sr_tcp_connect(tcp->tcp_dev);
+	if (ret != SR_OK)
+		return ret;
+
+	one = 1;
+	if (setsockopt(tcp->tcp_dev->sock_fd, IPPROTO_TCP, TCP_NODELAY,
+			(const void *)&one, sizeof(one)) < 0)
+		sr_warn("Cannot set TCP_NODELAY: %s", g_strerror(errno));
+
+	return SR_OK;
+}
+
+/*
+ * Transmit text, usually a command. tcp-rigol mode.
+ *
+ * The VS5000 only accepts commands that are terminated by CR LF, and the
+ * terminator must arrive in the same TCP segment as the command. Replace
+ * the LF that the SCPI core appends by CR LF and send it all at once.
+ */
+static int scpi_tcp_rigol_send(void *priv, const char *command)
+{
+	struct scpi_tcp *tcp = priv;
+	size_t cmdlen, wrlen, written;
+	char *buf;
+	int ret;
+
+	cmdlen = strlen(command);
+	while (cmdlen && (command[cmdlen - 1] == '\n' || command[cmdlen - 1] == '\r'))
+		cmdlen--;
+	buf = g_strdup_printf("%.*s\r\n", (int)cmdlen, command);
+	wrlen = cmdlen + 2;
+
+	ret = sr_tcp_write_bytes(tcp->tcp_dev, (const uint8_t *)buf, wrlen);
+	if (ret < 0) {
+		sr_err("Send error: %s", g_strerror(errno));
+		g_free(buf);
+		return SR_ERR;
+	}
+	written = (size_t)ret;
+	if (written < wrlen) {
+		sr_dbg("Only sent %zu/%zu bytes of SCPI command: '%.*s'.",
+			written, wrlen, (int)cmdlen, command);
+	}
+
+	sr_spew("Successfully sent SCPI command: '%.*s'.", (int)cmdlen, command);
+	g_free(buf);
 
 	return SR_OK;
 }
@@ -297,11 +372,11 @@ SR_PRIV const struct sr_scpi_dev_inst scpi_tcp_rigol_dev = {
 	.transport     = SCPI_TRANSPORT_RIGOL_TCP,
 	.priv_size     = sizeof(struct scpi_tcp),
 	.dev_inst_new  = scpi_tcp_dev_inst_new,
-	.open          = scpi_tcp_open,
+	.open          = scpi_tcp_rigol_open,
 	.connection_id = scpi_tcp_connection_id,
 	.source_add    = scpi_tcp_source_add,
 	.source_remove = scpi_tcp_source_remove,
-	.send          = scpi_tcp_send,
+	.send          = scpi_tcp_rigol_send,
 	.read_begin    = scpi_tcp_read_begin,
 	.read_data     = scpi_tcp_rigol_read_data,
 	.read_complete = scpi_tcp_read_complete,
