@@ -1156,6 +1156,15 @@ enum sr_configkey {
 	 */
 	SR_CONF_INVERTED,
 
+	/**
+	 * Trigger sweep of an oscilloscope.
+	 * @arg type: string, e.g. "Auto", "Normal" or "Single"
+	 * @arg get: get the current sweep
+	 * @arg set: change the sweep
+	 * @arg list: list the supported sweeps
+	 */
+	SR_CONF_TRIGGER_SWEEP,
+
 	/* Update sr_key_info_config[] (hwdriver.c) upon changes! */
 
 	/*--- Special stuff -------------------------------------------------*/
