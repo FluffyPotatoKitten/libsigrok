@@ -30,6 +30,21 @@
 
 /* Size of acquisition buffers */
 #define ACQ_BUFFER_SIZE (32 * 1024)
+/* VS5000: samples at the start of a channel block that end the record. */
+#define V1_HEAD_SAMPLES 2
+/* Minimum code next to a 0 byte at a live record end to treat it as a glitch. */
+#define V1_GLITCH_MIN_NEIGHBOUR 16
+/* VS5000 ADC codes: 0 is the top (+5 div), 255 the bottom (-5.2 div). */
+#define V1_CODE_MIN 0
+#define V1_CODE_MAX 255
+/* VS5000: the acquisition memory spans up to about 26.2 divisions. */
+#define V1_MEMORY_DIVS 26.3
+/*
+ * VS5000: margin after the memory span before a forced trigger (us). A shot
+ * with an immediate real trigger takes 260..470 ms plus the pre-trigger fill
+ * from :RUN to STOP (measured), a real trigger should win.
+ */
+#define V1_FORCE_MARGIN_US 600000
 
 /* Maximum number of samples to retrieve at once. */
 #define ACQ_BLOCK_SIZE (30 * 1000)
@@ -140,6 +155,22 @@ struct dev_context {
 	float horiz_triggerpos;
 	char *trigger_slope;
 	float trigger_level;
+	/* Trigger sweep as the scope reports it (AUTO, NORMAL, SINGLE), V1 only. */
+	char *trigger_sweep;
+	/* Trigger type (:TRIG:MODE?, e.g. EDGE) the sweep belongs to, V1 only. */
+	char *trigger_type;
+	/* V1: a live or memory acquisition is running. */
+	gboolean v1_acquiring;
+	/* V1: the thread that runs the acquisition (receive callback). */
+	GThread *v1_session_thread;
+	/*
+	 * V1: commands from other threads while acquiring, sent by the
+	 * acquisition between two waveform replies (rigol_ds_v1_flush).
+	 */
+	GMutex v1_cmd_lock;
+	GSList *v1_pending_cmds;
+	/* V1 live over USB: waveform requests failed in a row. */
+	int v1_failures;
 	char *coupling[MAX_ANALOG_CHANNELS];
 
 	/* Number of frames received in total. */
@@ -163,6 +194,36 @@ struct dev_context {
 	/* Acq buffers used for reading from the scope and sending data to app */
 	unsigned char *buffer;
 	float *data;
+	/* V1 (VS5000): one :WAVEFORM:DATA? reply carries all channels. */
+	gboolean v1_header_pending;
+	/* V1: reply bytes after the header that have not been read yet. */
+	uint64_t v1_remaining;
+	/* V1: first bytes of a channel, they belong at its end. */
+	unsigned char v1_head[V1_HEAD_SAMPLES];
+	/* V1: bytes collected in buffer for the next packet. */
+	uint64_t v1_fill;
+	/*
+	 * VS5000 memory mode: raw data of the channels before the last one,
+	 * held back so that the channels can be sent alternately.
+	 */
+	unsigned char *v1_mem;
+	size_t v1_mem_size;
+	/* VS5000 memory mode: trigger mode and sweep to restore at the end. */
+	char *v1_trigger_mode;
+	char *v1_sweep;
+	/* VS5000 memory mode: start of the current shot, forced trigger sent. */
+	int64_t v1_shot_start;
+	gboolean v1_forced;
+	/* VS5000 live capture with the SINGLE sweep: one :RUN per frame. */
+	gboolean v1_single;
+	/*
+	 * VS5000 firmware patch level, from the *IDN? version: 0 for stock
+	 * firmware, n for "03.00.00.01.P<n>" (community fixes for the LAN
+	 * interface; level 1 makes :WAVEFORM:ALL? safe over LAN).
+	 */
+	int v1_fw_patch;
+	/* VS5000 over LAN: a reconnect after out-of-step replies is pending. */
+	gboolean v1_resyncing;
 };
 
 SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *format, ...);
@@ -171,5 +232,16 @@ SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi);
 SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data);
 SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi);
 SR_PRIV int rigol_ds_get_dev_cfg_vertical(const struct sr_dev_inst *sdi);
+SR_PRIV double rigol_ds_v1_record_divs(const struct dev_context *devc);
+SR_PRIV uint64_t rigol_ds_v1_live_rate(const struct dev_context *devc);
+SR_PRIV void rigol_ds_v1_input_range(const struct dev_context *devc,
+	int ch, double *low, double *high);
+SR_PRIV char *rigol_ds_v1_range_string(const struct dev_context *devc, int ch);
+SR_PRIV gboolean rigol_ds_v1_memory_supported(const struct sr_dev_inst *sdi);
+SR_PRIV int rigol_ds_v1_fw_patch(const char *version);
+SR_PRIV void rigol_ds_v1_cancel_resync(const struct sr_dev_inst *sdi);
+SR_PRIV int rigol_ds_v1_stop(const struct sr_dev_inst *sdi);
+SR_PRIV void rigol_ds_v1_abort_reply(struct sr_dev_inst *sdi);
+SR_PRIV void rigol_ds_v1_flush(const struct sr_dev_inst *sdi);
 
 #endif

@@ -53,11 +53,36 @@ static const uint32_t devopts[] = {
 	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
+/* VS5000: devopts plus the trigger sweep. */
+static const uint32_t devopts_v1[] = {
+	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_NUM_HDIV | SR_CONF_GET,
+	SR_CONF_HORIZ_TRIGGERPOS | SR_CONF_SET,
+	SR_CONF_TRIGGER_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+};
+
 static const uint32_t devopts_cg_analog[] = {
 	SR_CONF_NUM_VDIV | SR_CONF_GET,
 	SR_CONF_VDIV | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_COUPLING | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_PROBE_FACTOR | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_OFFSET | SR_CONF_GET | SR_CONF_SET,
+};
+
+/* VS5000: per channel also the input range given by V/div and offset. */
+static const uint32_t devopts_cg_analog_v1[] = {
+	SR_CONF_NUM_VDIV | SR_CONF_GET,
+	SR_CONF_VDIV | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_COUPLING | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_PROBE_FACTOR | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_OFFSET | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_RANGE | SR_CONF_GET,
 };
 
 static const uint64_t timebases[][2] = {
@@ -69,6 +94,7 @@ static const uint64_t timebases[][2] = {
 	{ 20, 1000000000 },
 	{ 50, 1000000000 },
 	{ 100, 1000000000 },
+	{ 200, 1000000000 },
 	{ 500, 1000000000 },
 	/* microseconds */
 	{ 1, 1000000 },
@@ -144,6 +170,15 @@ static const char *trigger_slopes[] = {
 	"r", "f",
 };
 
+/* VS5000 trigger sweeps, and how the scope names them. */
+static const char *trigger_sweeps[] = {
+	"Auto", "Normal", "Single",
+};
+
+static const char *trigger_sweeps_scpi[] = {
+	"AUTO", "NORMAL", "SINGLE",
+};
+
 static const char *coupling[] = {
 	"AC", "DC", "GND",
 };
@@ -198,7 +233,7 @@ static const struct rigol_ds_vendor supported_vendors[] = {
  * number of horizontal divs, live waveform samples, memory buffer samples */
 static const struct rigol_ds_series supported_series[] = {
 	[VS5000] = {VENDOR(RIGOL), "VS5000", PROTOCOL_V1, FORMAT_RAW,
-		{50, 1}, {2, 1000}, 14, 2048, 0},
+		{50, 1}, {2, 1000}, 14, 2048, 524288},
 	[DS1000] = {VENDOR(RIGOL), "DS1000", PROTOCOL_V2, FORMAT_IEEE488_2,
 		{50, 1}, {2, 1000}, 12, 600, 1048576},
 	[DS2000] = {VENDOR(RIGOL), "DS2000", PROTOCOL_V3, FORMAT_IEEE488_2,
@@ -307,6 +342,10 @@ static void clear_helper(struct dev_context *devc)
 		g_free(devc->coupling[i]);
 	g_free(devc->trigger_source);
 	g_free(devc->trigger_slope);
+	g_free(devc->trigger_sweep);
+	g_free(devc->trigger_type);
+	g_slist_free_full(devc->v1_pending_cmds, g_free);
+	g_mutex_clear(&devc->v1_cmd_lock);
 	g_free(devc->analog_groups);
 }
 
@@ -359,9 +398,17 @@ static struct sr_dev_inst *probe_device(struct sr_scpi_dev_inst *scpi)
 	sdi->inst_type = SR_INST_SCPI;
 	sdi->serial_num = g_strdup(hw_info->serial_number);
 	devc = g_malloc0(sizeof(struct dev_context));
+	g_mutex_init(&devc->v1_cmd_lock);
 	devc->limit_frames = 0;
 	devc->model = model;
 	devc->format = model->series->format;
+
+	if (model->series == SERIES(VS5000)) {
+		devc->v1_fw_patch = rigol_ds_v1_fw_patch(hw_info->firmware_version);
+		if (devc->v1_fw_patch)
+			sr_info("VS5000 firmware patch level %d (%s): memory over LAN available.",
+				devc->v1_fw_patch, hw_info->firmware_version);
+	}
 
 	/* DS1000 models with firmware before 0.2.4 used the old data format. */
 	if (model->series == SERIES(DS1000)) {
@@ -428,7 +475,7 @@ static struct sr_dev_inst *probe_device(struct sr_scpi_dev_inst *scpi)
 	}
 
 	devc->buffer = g_malloc(ACQ_BUFFER_SIZE);
-	devc->data = g_malloc(ACQ_BUFFER_SIZE * sizeof(float));
+	devc->data = g_malloc((ACQ_BUFFER_SIZE + V1_HEAD_SAMPLES) * sizeof(float));
 
 	devc->data_source = DATA_SOURCE_LIVE;
 
@@ -453,8 +500,26 @@ static int dev_open(struct sr_dev_inst *sdi)
 	}
 
 	if ((ret = rigol_ds_get_dev_cfg(sdi)) < 0) {
-		sr_err("Failed to get device config: %s.", sr_strerror(ret));
-		return SR_ERR;
+		/*
+		 * Retry once on a new connection. Seen on the VS5000 over LAN
+		 * right after a client died in the middle of a waveform
+		 * transfer: the first query got no answer within the read
+		 * timeout. Asking again on the same connection could read the
+		 * late answer of the first query as the answer to the next.
+		 */
+		sr_warn("Failed to get device config (%s), retrying on a new "
+			"connection.", sr_strerror(ret));
+		sr_scpi_close(scpi);
+		g_usleep(2 * G_USEC_PER_SEC);
+		if ((ret = sr_scpi_open(scpi)) < 0) {
+			sr_err("Failed to reopen SCPI device: %s.", sr_strerror(ret));
+			return SR_ERR;
+		}
+		if ((ret = rigol_ds_get_dev_cfg(sdi)) < 0) {
+			sr_err("Failed to get device config: %s.", sr_strerror(ret));
+			sr_scpi_close(scpi);
+			return SR_ERR;
+		}
 	}
 
 	return SR_OK;
@@ -498,6 +563,9 @@ static int analog_frame_size(const struct sr_dev_inst *sdi)
 		return devc->model->series->live_samples;
 	case DATA_SOURCE_MEMORY:
 	case DATA_SOURCE_SEGMENTED:
+		/* The VS5000 keeps 512K samples for each channel. */
+		if (devc->model->series->protocol == PROTOCOL_V1)
+			return devc->model->series->buffer_samples;
 		return devc->model->series->buffer_samples / analog_channels;
 	default:
 		return 0;
@@ -517,6 +585,44 @@ static int digital_frame_size(const struct sr_dev_inst *sdi)
 	default:
 		return 0;
 	}
+}
+
+/*
+ * VS5000 volts/div at the probe tip: 2 mV to 10 V times the probe factor
+ * (the scope keeps the setting within that, tested with 1x, 10x, 100x).
+ * Fills vd with the 1-2-5 steps in that range, returns their number.
+ */
+#define V1_MAX_VDIVS 32
+static int v1_vdivs(const struct dev_context *devc, int ch,
+		uint64_t vd[][2])
+{
+	static const uint64_t mant[] = { 1, 2, 5 };
+	double probe, v;
+	uint64_t num, den;
+	int e, m, n;
+
+	probe = devc->attenuation[ch] > 0 ? devc->attenuation[ch] : 1;
+	n = 0;
+	for (e = -3; e <= 3 && n < V1_MAX_VDIVS; e++) {
+		for (m = 0; m < 3 && n < V1_MAX_VDIVS; m++) {
+			/* Millivolts below 1 V, so that they print as mV. */
+			if (e < 0) {
+				num = mant[m] * (uint64_t)pow(10, e + 3);
+				den = 1000;
+			} else {
+				num = mant[m] * (uint64_t)pow(10, e);
+				den = 1;
+			}
+			v = (double)num / den;
+			if (v < 0.002 * probe * 0.999 || v > 10.0 * probe * 1.001)
+				continue;
+			vd[n][0] = num;
+			vd[n][1] = den;
+			n++;
+		}
+	}
+
+	return n;
 }
 
 static int config_get(uint32_t key, GVariant **data,
@@ -574,18 +680,21 @@ static int config_get(uint32_t key, GVariant **data,
 		*data = g_variant_new_uint64(devc->sample_rate);
 		break;
 	case SR_CONF_TRIGGER_SOURCE:
-		if (!strcmp(devc->trigger_source, "ACL"))
+		/*
+		 * Most models answer CHAN1 and ACL, the VS5000 answers the
+		 * long forms CHANNEL1 and ACLINE: map both to the names in
+		 * the list.
+		 */
+		tmp_str = devc->trigger_source;
+		if (!strncmp(tmp_str, "ACL", 3))
 			tmp_str = "AC Line";
-		else if (!strcmp(devc->trigger_source, "CHAN1"))
-			tmp_str = "CH1";
-		else if (!strcmp(devc->trigger_source, "CHAN2"))
-			tmp_str = "CH2";
-		else if (!strcmp(devc->trigger_source, "CHAN3"))
-			tmp_str = "CH3";
-		else if (!strcmp(devc->trigger_source, "CHAN4"))
-			tmp_str = "CH4";
-		else
-			tmp_str = devc->trigger_source;
+		else if (!strncmp(tmp_str, "CHAN", 4)) {
+			const char *num = tmp_str + strcspn(tmp_str, "0123456789");
+			if (num[0] >= '1' && num[0] <= '4' && !num[1]) {
+				static const char *const chn[] = { "CH1", "CH2", "CH3", "CH4" };
+				tmp_str = chn[num[0] - '1'];
+			}
+		}
 		*data = g_variant_new_string(tmp_str);
 		break;
 	case SR_CONF_TRIGGER_SLOPE:
@@ -601,6 +710,19 @@ static int config_get(uint32_t key, GVariant **data,
 		break;
 	case SR_CONF_TRIGGER_LEVEL:
 		*data = g_variant_new_double(devc->trigger_level);
+		break;
+	case SR_CONF_TRIGGER_SWEEP:
+		if (!devc->trigger_sweep)
+			return SR_ERR_NA;
+		for (i = 0; i < ARRAY_SIZE(trigger_sweeps); i++)
+			if (!g_ascii_strcasecmp(devc->trigger_sweep,
+					trigger_sweeps_scpi[i]))
+				break;
+		if (i == ARRAY_SIZE(trigger_sweeps)) {
+			sr_dbg("Unknown trigger sweep: '%s'.", devc->trigger_sweep);
+			return SR_ERR_NA;
+		}
+		*data = g_variant_new_string(trigger_sweeps[i]);
 		break;
 	case SR_CONF_TIMEBASE:
 		for (i = 0; i < devc->num_timebases; i++) {
@@ -622,6 +744,22 @@ static int config_get(uint32_t key, GVariant **data,
 		if (analog_channel < 0) {
 			sr_dbg("Negative analog channel: %d.", analog_channel);
 			return SR_ERR_NA;
+		}
+		if (devc->model->series->protocol == PROTOCOL_V1) {
+			uint64_t vd[V1_MAX_VDIVS][2];
+			unsigned int n = v1_vdivs(devc, analog_channel, vd);
+			for (i = 0; i < n; i++) {
+				float diff = fabs(devc->vdiv[analog_channel] -
+					(float)vd[i][0] / vd[i][1]);
+				if (diff < smallest_diff) {
+					smallest_diff = diff;
+					idx = i;
+				}
+			}
+			if (idx < 0)
+				return SR_ERR_NA;
+			*data = g_variant_new("(tt)", vd[idx][0], vd[idx][1]);
+			break;
 		}
 		for (i = 0; i < ARRAY_SIZE(vdivs); i++) {
 			float vdiv = (float)vdivs[i][0] / vdivs[i][1];
@@ -651,11 +789,49 @@ static int config_get(uint32_t key, GVariant **data,
 		}
 		*data = g_variant_new_uint64(devc->attenuation[analog_channel]);
 		break;
+	case SR_CONF_RANGE:
+		/* VS5000: input voltages that do not clip, as text. */
+		if (analog_channel < 0 ||
+				devc->model->series->protocol != PROTOCOL_V1)
+			return SR_ERR_NA;
+		*data = g_variant_new_take_string(
+			rigol_ds_v1_range_string(devc, analog_channel));
+		break;
+	case SR_CONF_OFFSET:
+		/*
+		 * Vertical offset in volts at the probe tip, as the scope
+		 * reports it. It moves the trace on the screen and so the
+		 * input range: the ADC covers the 8 divisions around
+		 * -offset. Sample values are input voltages, they do not
+		 * include the offset.
+		 */
+		if (analog_channel < 0) {
+			sr_dbg("Negative analog channel: %d.", analog_channel);
+			return SR_ERR_NA;
+		}
+		*data = g_variant_new_double(devc->vert_offset[analog_channel]);
+		break;
 	default:
 		return SR_ERR_NA;
 	}
 
 	return SR_OK;
+}
+
+/*
+ * Re-read gain and offset after a vertical change. Not while another thread
+ * acquires from a VS5000: its commands are queued (rigol_ds_config_set) and
+ * a query would interleave with the waveform reply. The values are read
+ * again when the next acquisition starts.
+ */
+static void vertical_readback(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+
+	if (devc->model->series->protocol == PROTOCOL_V1 && devc->v1_acquiring &&
+			g_thread_self() != devc->v1_session_thread)
+		return;
+	rigol_ds_get_dev_cfg_vertical(sdi);
 }
 
 static int config_set(uint32_t key, GVariant *data,
@@ -694,8 +870,12 @@ static int config_set(uint32_t key, GVariant *data,
 		}
 		devc->horiz_triggerpos = t_dbl;
 		/* We have the trigger offset as a percentage of the frame, but
-		 * need to express this in seconds. */
-		t_dbl = -(devc->horiz_triggerpos - 0.5) * devc->timebase * devc->num_timebases;
+		 * need to express this in seconds. The VS5000 frame holds
+		 * 20.48 or 14 divisions, other models fill the screen. */
+		t_dbl = -(devc->horiz_triggerpos - 0.5) * devc->timebase *
+			(devc->model->series->protocol == PROTOCOL_V1 ?
+				rigol_ds_v1_record_divs(devc) :
+				devc->model->series->num_horizontal_divs);
 		g_ascii_formatd(buffer, sizeof(buffer), "%.6f", t_dbl);
 		return rigol_ds_config_set(sdi,
 			devc->model->cmds[CMD_SET_HORIZ_TRIGGERPOS].str, buffer);
@@ -706,13 +886,46 @@ static int config_set(uint32_t key, GVariant *data,
 		if (ret == SR_OK)
 			devc->trigger_level = t_dbl;
 		return ret;
+	case SR_CONF_TRIGGER_SWEEP:
+		if (devc->model->series->protocol != PROTOCOL_V1 ||
+				!devc->trigger_type)
+			return SR_ERR_NA;
+		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(trigger_sweeps))) < 0)
+			return SR_ERR_ARG;
+		/*
+		 * Only commands, no queries: this may run in another thread
+		 * while a waveform reply is being read, and over LAN a query
+		 * would read reply bytes as its answer.
+		 */
+		ret = rigol_ds_config_set(sdi, ":TRIG:%s:SWE %s",
+			devc->trigger_type, trigger_sweeps_scpi[idx]);
+		if (ret != SR_OK)
+			return ret;
+		g_free(devc->trigger_sweep);
+		devc->trigger_sweep = g_strdup(trigger_sweeps_scpi[idx]);
+		if (devc->v1_acquiring && devc->data_source == DATA_SOURCE_LIVE) {
+			/* A running live capture re-arms each SINGLE shot. */
+			devc->v1_single = idx == 2;
+			/* A finished SINGLE shot left the scope stopped. */
+			if (!devc->v1_single)
+				return rigol_ds_config_set(sdi, ":RUN");
+		}
+		return SR_OK;
 	case SR_CONF_TIMEBASE:
 		if ((idx = std_u64_tuple_idx(data, devc->timebases, devc->num_timebases)) < 0)
 			return SR_ERR_ARG;
 		devc->timebase = (float)devc->timebases[idx][0] / devc->timebases[idx][1];
 		g_ascii_formatd(buffer, sizeof(buffer), "%.9f",
 		                devc->timebase);
-		return rigol_ds_config_set(sdi, ":TIM:SCAL %s", buffer);
+		ret = rigol_ds_config_set(sdi, ":TIM:SCAL %s", buffer);
+		/*
+		 * Frontends such as PulseView read the sample rate before
+		 * they start an acquisition, keep it in step.
+		 */
+		if (ret == SR_OK && devc->model->series->protocol == PROTOCOL_V1 &&
+				devc->data_source == DATA_SOURCE_LIVE)
+			devc->sample_rate = rigol_ds_v1_live_rate(devc);
+		return ret;
 	case SR_CONF_TRIGGER_SOURCE:
 		if ((idx = std_str_idx(data, devc->model->trigger_sources, devc->model->num_trigger_sources)) < 0)
 			return SR_ERR_ARG;
@@ -736,11 +949,23 @@ static int config_set(uint32_t key, GVariant *data,
 			return SR_ERR_CHANNEL_GROUP;
 		if ((i = std_cg_idx(cg, devc->analog_groups, devc->model->analog_channels)) < 0)
 			return SR_ERR_ARG;
-		if ((idx = std_u64_tuple_idx(data, ARRAY_AND_SIZE(vdivs))) < 0)
-			return SR_ERR_ARG;
-		devc->vdiv[i] = (float)vdivs[idx][0] / vdivs[idx][1];
+		if (devc->model->series->protocol == PROTOCOL_V1) {
+			uint64_t vd[V1_MAX_VDIVS][2];
+			int n = v1_vdivs(devc, i, vd);
+			if ((idx = std_u64_tuple_idx(data, vd, n)) < 0)
+				return SR_ERR_ARG;
+			devc->vdiv[i] = (float)vd[idx][0] / vd[idx][1];
+		} else {
+			if ((idx = std_u64_tuple_idx(data, ARRAY_AND_SIZE(vdivs))) < 0)
+				return SR_ERR_ARG;
+			devc->vdiv[i] = (float)vdivs[idx][0] / vdivs[idx][1];
+		}
 		g_ascii_formatd(buffer, sizeof(buffer), "%.3f", devc->vdiv[i]);
-		return rigol_ds_config_set(sdi, ":CHAN%d:SCAL %s", i + 1, buffer);
+		ret = rigol_ds_config_set(sdi, ":CHAN%d:SCAL %s", i + 1, buffer);
+		/* The scope may limit the offset to the new range. */
+		if (ret == SR_OK)
+			vertical_readback(sdi);
+		return ret;
 	case SR_CONF_COUPLING:
 		if (!cg)
 			return SR_ERR_CHANNEL_GROUP;
@@ -762,13 +987,30 @@ static int config_set(uint32_t key, GVariant *data,
 		devc->attenuation[i] = probe_factor[idx];
 		ret = rigol_ds_config_set(sdi, ":CHAN%d:PROB %"PRIu64, i + 1, p);
 		if (ret == SR_OK)
-			rigol_ds_get_dev_cfg_vertical(sdi);
+			vertical_readback(sdi);
 		return ret;
+	case SR_CONF_OFFSET:
+		if (!cg)
+			return SR_ERR_CHANNEL_GROUP;
+		if ((i = std_cg_idx(cg, devc->analog_groups, devc->model->analog_channels)) < 0)
+			return SR_ERR_ARG;
+		t_dbl = g_variant_get_double(data);
+		if (!isfinite(t_dbl))
+			return SR_ERR_ARG;
+		g_ascii_formatd(buffer, sizeof(buffer), "%.4f", t_dbl);
+		ret = rigol_ds_config_set(sdi, ":CHAN%d:OFFS %s", i + 1, buffer);
+		if (ret != SR_OK)
+			return ret;
+		/* Read back, the scope limits the offset per V/div. */
+		devc->vert_offset[i] = t_dbl;
+		vertical_readback(sdi);
+		return SR_OK;
 	case SR_CONF_DATA_SOURCE:
 		tmp_str = g_variant_get_string(data, NULL);
 		if (!strcmp(tmp_str, "Live"))
 			devc->data_source = DATA_SOURCE_LIVE;
-		else if (devc->model->series->protocol >= PROTOCOL_V2
+		else if ((devc->model->series->protocol >= PROTOCOL_V2 ||
+				rigol_ds_v1_memory_supported(sdi))
 			&& !strcmp(tmp_str, "Memory"))
 			devc->data_source = DATA_SOURCE_MEMORY;
 		else if (devc->model->series->protocol >= PROTOCOL_V3
@@ -796,6 +1038,8 @@ static int config_list(uint32_t key, GVariant **data,
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
+		if (!cg && devc && devc->model->series->protocol == PROTOCOL_V1)
+			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_v1);
 		if (!cg)
 			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
 		if (!devc)
@@ -806,7 +1050,10 @@ static int config_list(uint32_t key, GVariant **data,
 		} else {
 			if (std_cg_idx(cg, devc->analog_groups, devc->model->analog_channels) < 0)
 				return SR_ERR_ARG;
-			*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog));
+			if (devc->model->series->protocol == PROTOCOL_V1)
+				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog_v1));
+			else
+				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog));
 			return SR_OK;
 		}
 		break;
@@ -826,6 +1073,15 @@ static int config_list(uint32_t key, GVariant **data,
 			return SR_ERR_ARG;
 		if (!cg)
 			return SR_ERR_CHANNEL_GROUP;
+		if (devc->model->series->protocol == PROTOCOL_V1) {
+			uint64_t vd[V1_MAX_VDIVS][2];
+			int ch;
+			if ((ch = std_cg_idx(cg, devc->analog_groups,
+					devc->model->analog_channels)) < 0)
+				return SR_ERR_ARG;
+			*data = std_gvar_tuple_array(vd, v1_vdivs(devc, ch, vd));
+			break;
+		}
 		*data = std_gvar_tuple_array(devc->vdivs, devc->num_vdivs);
 		break;
 	case SR_CONF_TIMEBASE:
@@ -845,13 +1101,18 @@ static int config_list(uint32_t key, GVariant **data,
 	case SR_CONF_TRIGGER_SLOPE:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_slopes));
 		break;
+	case SR_CONF_TRIGGER_SWEEP:
+		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_sweeps));
+		break;
 	case SR_CONF_DATA_SOURCE:
 		if (!devc)
 			/* Can't know this until we have the exact model. */
 			return SR_ERR_ARG;
 		switch (devc->model->series->protocol) {
 		case PROTOCOL_V1:
-			*data = g_variant_new_strv(data_sources, ARRAY_SIZE(data_sources) - 2);
+			/* Memory over USB, or over LAN on patched firmware. */
+			*data = g_variant_new_strv(data_sources, ARRAY_SIZE(data_sources) -
+				(rigol_ds_v1_memory_supported(sdi) ? 1 : 2));
 			break;
 		case PROTOCOL_V2:
 			*data = g_variant_new_strv(data_sources, ARRAY_SIZE(data_sources) - 1);
@@ -875,9 +1136,10 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	struct sr_channel *ch;
 	gboolean some_digital;
 	GSList *l;
-	char *cmd;
+	char *cmd, *v1_mode, *v1_sweep;
 	int protocol;
 	int ret;
+	float sample_rate = 0;
 
 	scpi = sdi->conn;
 	devc = sdi->priv;
@@ -984,6 +1246,75 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->analog_frame_size = analog_frame_size(sdi);
 	devc->digital_frame_size = digital_frame_size(sdi);
 
+	if (protocol == PROTOCOL_V1 && devc->data_source == DATA_SOURCE_MEMORY) {
+		if (some_digital) {
+			sr_err("Memory data source: digital channels not supported.");
+			return SR_ERR;
+		}
+		/* Take single shots, restore the sweep when done. */
+		g_free(devc->v1_trigger_mode);
+		g_free(devc->v1_sweep);
+		devc->v1_trigger_mode = devc->v1_sweep = NULL;
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:MODE?",
+				&devc->v1_trigger_mode) != SR_OK)
+			return SR_ERR;
+		cmd = g_strdup_printf(":TRIG:%s:SWE?", devc->v1_trigger_mode);
+		ret = sr_scpi_get_string(sdi->conn, cmd, &devc->v1_sweep);
+		g_free(cmd);
+		if (ret != SR_OK)
+			return SR_ERR;
+		/*
+		 * Stop a running acquisition first. A first shot armed while
+		 * the scope was running continuously sometimes held a 128K
+		 * block of one channel from another acquisition (seam at
+		 * sample 262144 or 393216). Shots armed from a stopped scope
+		 * never did.
+		 */
+		if (rigol_ds_v1_stop(sdi) != SR_OK)
+			return SR_ERR;
+		if (rigol_ds_config_set(sdi, ":TRIG:%s:SWE SINGLE",
+				devc->v1_trigger_mode) != SR_OK)
+			return SR_ERR;
+		/*
+		 * Keep 512K samples per channel. With NORMAL the memory only
+		 * holds the 4096 samples of the display record. The setting
+		 * itself cannot be read back (:ACQ:MEM? reports the depth
+		 * of the last shot), so it is left at FULL.
+		 */
+		if (rigol_ds_config_set(sdi, ":ACQ:MEM FULL") != SR_OK)
+			return SR_ERR;
+		/*
+		 * Preliminary: this is the rate of the last capture. It is
+		 * read again after each shot and sent as meta if it differs.
+		 */
+		if (sr_scpi_get_float(sdi->conn, ":ACQ:SAMP?", &sample_rate) != SR_OK ||
+				sample_rate <= 0) {
+			sr_err("Cannot get the sample rate (:ACQ:SAMP?).");
+			return SR_ERR;
+		}
+	}
+
+	/* Gain and offset scale the samples, they may have been changed
+	 * by other software since the device was opened. */
+	if (protocol == PROTOCOL_V1 && rigol_ds_get_dev_cfg_vertical(sdi) != SR_OK)
+		return SR_ERR;
+
+	devc->v1_single = FALSE;
+	devc->v1_failures = 0;
+	if (protocol == PROTOCOL_V1 && devc->data_source == DATA_SOURCE_LIVE) {
+		/* The SINGLE sweep stops after each shot, see capture_start. */
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:MODE?", &v1_mode) != SR_OK)
+			return SR_ERR;
+		cmd = g_strdup_printf(":TRIG:%s:SWE?", v1_mode);
+		g_free(v1_mode);
+		ret = sr_scpi_get_string(sdi->conn, cmd, &v1_sweep);
+		g_free(cmd);
+		if (ret != SR_OK)
+			return SR_ERR;
+		devc->v1_single = !g_ascii_strcasecmp(v1_sweep, "SINGLE");
+		g_free(v1_sweep);
+	}
+
 	switch (devc->model->series->protocol) {
 	case PROTOCOL_V2:
 		if (rigol_ds_config_set(sdi, ":ACQ:MEMD LONG") != SR_OK)
@@ -1009,14 +1340,28 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		if (rigol_ds_config_set(sdi, ":RUN") != SR_OK)
 			return SR_ERR;
 
-	sr_scpi_source_add(sdi->session, scpi, G_IO_IN, 50,
-			rigol_ds_receive, (void *)sdi);
+	devc->v1_session_thread = g_thread_self();
+	devc->v1_acquiring = protocol == PROTOCOL_V1;
 
-	std_session_send_df_header(sdi);
+	/*
+	 * The receive callback reads one buffer per call. The VS5000 memory
+	 * (512K samples per channel) is read after the shot, when there is
+	 * nothing to wait for: poll fast, or one frame takes seconds.
+	 */
+	sr_scpi_source_add(sdi->session, scpi, G_IO_IN,
+			(protocol == PROTOCOL_V1 &&
+			 devc->data_source == DATA_SOURCE_MEMORY) ? 2 : 50,
+			rigol_ds_receive, (void *)sdi);
 
 	devc->channel_entry = devc->enabled_channels;
 
-	if (devc->data_source == DATA_SOURCE_LIVE) {
+	if (devc->data_source == DATA_SOURCE_LIVE &&
+			devc->model->series->protocol == PROTOCOL_V1) {
+		devc->sample_rate = rigol_ds_v1_live_rate(devc);
+	} else if (devc->model->series->protocol == PROTOCOL_V1) {
+		/* Memory: full ADC rate, read above. */
+		devc->sample_rate = sample_rate;
+	} else if (devc->data_source == DATA_SOURCE_LIVE) {
 		devc->sample_rate = analog_frame_size(sdi) /
 			(devc->timebase * devc->model->series->num_horizontal_divs);
 	} else {
@@ -1037,6 +1382,16 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->sample_rate = 1. / xinc;
 	}
 
+	/* After the sample rate is known, outputs read it from the header. */
+	std_session_send_df_header(sdi);
+	/*
+	 * The rate depends on the timebase and the data source, a value
+	 * read before the start can be out of date.
+	 */
+	if (devc->model->series->protocol == PROTOCOL_V1 && devc->sample_rate)
+		sr_session_send_meta(sdi, SR_CONF_SAMPLERATE,
+			g_variant_new_uint64(devc->sample_rate));
+
 	if (rigol_ds_capture_start(sdi) != SR_OK)
 		return SR_ERR;
 
@@ -1054,11 +1409,31 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 	devc = sdi->priv;
 
 	std_session_send_df_end(sdi);
+	devc->v1_acquiring = FALSE;
+	/* Before abort_reply, which may reconnect (new socket). */
+	scpi = sdi->conn;
+	rigol_ds_v1_cancel_resync(sdi);
+	sr_scpi_source_remove(sdi->session, scpi);
+	rigol_ds_v1_abort_reply(sdi);
+	if (devc->model->series->protocol == PROTOCOL_V1)
+		rigol_ds_v1_flush(sdi);
+
+	/* VS5000 memory mode: restore the sweep, resume continuous sweeps. */
+	if (devc->v1_trigger_mode && devc->v1_sweep) {
+		rigol_ds_config_set(sdi, ":TRIG:%s:SWE %s",
+			devc->v1_trigger_mode, devc->v1_sweep);
+		if (g_ascii_strcasecmp(devc->v1_sweep, "SINGLE"))
+			rigol_ds_config_set(sdi, ":RUN");
+	}
+	g_free(devc->v1_trigger_mode);
+	g_free(devc->v1_sweep);
+	devc->v1_trigger_mode = devc->v1_sweep = NULL;
+	g_free(devc->v1_mem);
+	devc->v1_mem = NULL;
+	devc->v1_mem_size = 0;
 
 	g_slist_free(devc->enabled_channels);
 	devc->enabled_channels = NULL;
-	scpi = sdi->conn;
-	sr_scpi_source_remove(sdi->session, scpi);
 
 	return SR_OK;
 }
