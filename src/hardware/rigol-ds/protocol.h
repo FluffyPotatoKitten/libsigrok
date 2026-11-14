@@ -225,6 +225,8 @@ struct dev_context {
 	 * interface; level 1 makes :WAVEFORM:ALL? safe over LAN).
 	 */
 	int v1_fw_patch;
+	/* VS5000 memory depth for memory captures: FULL (512K) or NORMAL (4096). */
+	gboolean v1_mem_normal;
 	/* VS5000 over LAN: a reconnect after out-of-step replies is pending. */
 	gboolean v1_resyncing;
 	/*
