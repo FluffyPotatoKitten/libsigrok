@@ -64,8 +64,15 @@ static const uint32_t devopts_v1[] = {
 	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_BUFFERSIZE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
+
+/*
+ * VS5000 memory depths (:ACQ:MEM NORMAL / FULL): the 4096 points of the
+ * display record at the display rate, or 512K points at the full rate.
+ */
+static const uint64_t v1_mem_depths[] = { 4096, 524288 };
 
 static const uint32_t devopts_cg_analog[] = {
 	SR_CONF_NUM_VDIV | SR_CONF_GET,
@@ -711,6 +718,11 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_TRIGGER_LEVEL:
 		*data = g_variant_new_double(devc->trigger_level);
 		break;
+	case SR_CONF_BUFFERSIZE:
+		if (devc->model->series->protocol != PROTOCOL_V1)
+			return SR_ERR_NA;
+		*data = g_variant_new_uint64(v1_mem_depths[devc->v1_mem_normal ? 0 : 1]);
+		break;
 	case SR_CONF_TRIGGER_SWEEP:
 		if (!devc->trigger_sweep)
 			return SR_ERR_NA;
@@ -886,6 +898,14 @@ static int config_set(uint32_t key, GVariant *data,
 		if (ret == SR_OK)
 			devc->trigger_level = t_dbl;
 		return ret;
+	case SR_CONF_BUFFERSIZE:
+		if (devc->model->series->protocol != PROTOCOL_V1)
+			return SR_ERR_NA;
+		if ((idx = std_u64_idx(data, ARRAY_AND_SIZE(v1_mem_depths))) < 0)
+			return SR_ERR_ARG;
+		/* Sent when a memory capture starts. */
+		devc->v1_mem_normal = idx == 0;
+		return SR_OK;
 	case SR_CONF_TRIGGER_SWEEP:
 		if (devc->model->series->protocol != PROTOCOL_V1 ||
 				!devc->trigger_type)
@@ -1101,6 +1121,11 @@ static int config_list(uint32_t key, GVariant **data,
 	case SR_CONF_TRIGGER_SLOPE:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_slopes));
 		break;
+	case SR_CONF_BUFFERSIZE:
+		if (!devc || devc->model->series->protocol != PROTOCOL_V1)
+			return SR_ERR_NA;
+		*data = std_gvar_array_u64(ARRAY_AND_SIZE(v1_mem_depths));
+		break;
 	case SR_CONF_TRIGGER_SWEEP:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_sweeps));
 		break;
@@ -1276,12 +1301,14 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 				devc->v1_trigger_mode) != SR_OK)
 			return SR_ERR;
 		/*
-		 * Keep 512K samples per channel. With NORMAL the memory only
-		 * holds the 4096 samples of the display record. The setting
-		 * itself cannot be read back (:ACQ:MEM? reports the depth
-		 * of the last shot), so it is left at FULL.
+		 * The chosen memory depth (SR_CONF_BUFFERSIZE, FULL by
+		 * default): 512K samples per channel, or with NORMAL only the
+		 * 4096 samples of the display record. The setting itself
+		 * cannot be read back (:ACQ:MEM? reports the depth of the
+		 * last shot), so it is sent for every memory capture.
 		 */
-		if (rigol_ds_config_set(sdi, ":ACQ:MEM FULL") != SR_OK)
+		if (rigol_ds_config_set(sdi, devc->v1_mem_normal ?
+				":ACQ:MEM NORMAL" : ":ACQ:MEM FULL") != SR_OK)
 			return SR_ERR;
 		/*
 		 * Preliminary: this is the rate of the last capture. It is
