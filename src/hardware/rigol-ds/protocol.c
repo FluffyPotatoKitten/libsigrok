@@ -439,7 +439,10 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 				}
 			}
 
-			if (devc->data_source == DATA_SOURCE_LIVE && rigol_ds_config_set(sdi, ":SINGL") != SR_OK)
+			/* Memory: one new single shot per frame. Segmented reads
+			 * the recorded frames, without a new acquisition. */
+			if (devc->data_source == DATA_SOURCE_MEMORY &&
+					rigol_ds_config_set(sdi, ":SING") != SR_OK)
 				return SR_ERR;
 			rigol_ds_set_wait_event(devc, WAIT_STOP);
 			if (devc->data_source == DATA_SOURCE_SEGMENTED &&
@@ -668,11 +671,17 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			devc->analog_frame_size : devc->digital_frame_size;
 
 	if (devc->num_block_bytes == 0) {
+		/*
+		 * Live frames always cover the same points. Memory is read in
+		 * blocks, each block of each frame needs its own range.
+		 */
+		const gboolean set_range = first_frame ||
+			devc->data_source != DATA_SOURCE_LIVE;
 		if (devc->model->series->protocol >= PROTOCOL_V4) {
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:START %d",
+			if (set_range && rigol_ds_config_set(sdi, ":WAV:START %d",
 					devc->num_channel_bytes + 1) != SR_OK)
 				return TRUE;
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:STOP %d",
+			if (set_range && rigol_ds_config_set(sdi, ":WAV:STOP %d",
 					MIN(devc->num_channel_bytes + ACQ_BLOCK_SIZE,
 						devc->analog_frame_size)) != SR_OK)
 				return TRUE;
@@ -837,9 +846,10 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			devc->num_frames_segmented = frames;
 		}
 
+		/* Memory takes a new single shot per frame, like live mode
+		 * it runs until the frame limit. */
 		if (devc->num_frames == devc->limit_frames ||
-				devc->num_frames == devc->num_frames_segmented ||
-				devc->data_source == DATA_SOURCE_MEMORY) {
+				devc->num_frames == devc->num_frames_segmented) {
 			/* Last frame, stop capture. */
 			sr_dev_acquisition_stop(sdi);
 		} else {
