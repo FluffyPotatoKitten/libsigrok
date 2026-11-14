@@ -150,6 +150,8 @@ struct dev_context {
 	 * acquisition starts, after the channels are switched.
 	 */
 	int mem_level;
+	/* DS1000Z: the chosen depth itself, used when the channels allow it. */
+	uint64_t mem_req;
 	float trigger_level;
 	char *coupling[MAX_ANALOG_CHANNELS];
 

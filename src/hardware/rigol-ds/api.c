@@ -187,17 +187,39 @@ static int ds1000z_mem_level(const struct dev_context *devc)
 	return -1;
 }
 
+/*
+ * The memory depth to use with the enabled channels: a chosen depth if the
+ * channels allow it, else its level (like the scope, which halves the
+ * depth when a channel is added). FALSE if it is not known.
+ */
+static gboolean ds1000z_mem_effective(const struct sr_dev_inst *sdi,
+	uint64_t *depth)
+{
+	struct dev_context *devc = sdi->priv;
+	int level, l, n = ds1000z_active_channels(sdi);
+
+	if (devc->mem_level >= 0)
+		for (l = 0; l <= (int)ARRAY_SIZE(ds1000z_mem_depths); l++)
+			if (ds1000z_level_depth(l, n) == devc->mem_req) {
+				*depth = devc->mem_req;
+				return TRUE;
+			}
+	if ((level = ds1000z_mem_level(devc)) < 0)
+		return FALSE;
+	*depth = ds1000z_level_depth(level, n);
+	return TRUE;
+}
+
 /* Apply the chosen memory depth, after the channels are switched. */
 static int ds1000z_apply_mem_depth(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
-	uint64_t want, got;
+	uint64_t want, got = 0;
 	char *buf = NULL;
+	int tries;
 
-	if (!is_ds1000z(devc) || ds1000z_mem_level(devc) < 0)
+	if (!is_ds1000z(devc) || !ds1000z_mem_effective(sdi, &want))
 		return SR_OK;
-	want = ds1000z_level_depth(ds1000z_mem_level(devc),
-		ds1000z_active_channels(sdi));
 	/* The scope takes a new depth only while running. */
 	if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
 		return SR_ERR;
@@ -206,14 +228,26 @@ static int ds1000z_apply_mem_depth(const struct sr_dev_inst *sdi)
 		return SR_ERR;
 	}
 	g_free(buf);
-	if (want)
-		rigol_ds_config_set(sdi, ":ACQ:MDEP %" PRIu64, want);
-	else
-		rigol_ds_config_set(sdi, ":ACQ:MDEP AUTO");
-	if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
-		return SR_ERR;
-	got = g_ascii_strtoull(buf, NULL, 10);
-	g_free(buf);
+	/*
+	 * Right after a channel was switched on, the scope adapts its depth
+	 * itself and ignores a new one for a moment: try again.
+	 */
+	for (tries = 0; tries < 5; tries++) {
+		if (tries)
+			g_usleep(300 * 1000);
+		if (want)
+			rigol_ds_config_set(sdi, ":ACQ:MDEP %" PRIu64, want);
+		else
+			rigol_ds_config_set(sdi, ":ACQ:MDEP AUTO");
+		if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
+			return SR_ERR;
+		got = g_ascii_strtoull(buf, NULL, 10);
+		g_free(buf);
+		if (got == want)
+			break;
+		sr_dbg("Memory depth %" PRIu64 " not taken yet (%" PRIu64 ").",
+			want, got);
+	}
 	devc->mem_depth = got;
 	if (got != want)
 		sr_warn("Memory depth %" PRIu64 " not accepted (24M needs the "
@@ -763,9 +797,12 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_BUFFERSIZE:
 		if (!is_ds1000z(devc))
 			return SR_ERR_NA;
-		*data = g_variant_new_uint64(ds1000z_mem_level(devc) < 0 ?
-			devc->mem_depth : ds1000z_level_depth(ds1000z_mem_level(devc),
-				ds1000z_active_channels(sdi)));
+		{
+			uint64_t depth;
+			if (!ds1000z_mem_effective(sdi, &depth))
+				depth = devc->mem_depth;
+			*data = g_variant_new_uint64(depth);
+		}
 		break;
 	case SR_CONF_RANGE:
 		if (!is_ds1000z(devc) || analog_channel < 0)
@@ -884,17 +921,29 @@ static int config_set(uint32_t key, GVariant *data,
 		if (!is_ds1000z(devc))
 			return SR_ERR_NA;
 		/*
-		 * Remember the level, it is applied when an acquisition
-		 * starts: the channels (and so the possible depths) may still
-		 * change until then.
+		 * Remember the depth and its level, they are applied when an
+		 * acquisition starts: the channels (and so the possible
+		 * depths) may still change until then, sigrok-cli for example
+		 * selects the channels after setting the options. Accept a
+		 * depth possible with the enabled channels, or else with one,
+		 * two or four channels.
 		 */
-		n = ds1000z_active_channels(sdi);
-		for (level = 0; level <= (int)ARRAY_SIZE(ds1000z_mem_depths); level++)
-			if (ds1000z_level_depth(level, n) == depth)
-				break;
-		if (level > (int)ARRAY_SIZE(ds1000z_mem_depths))
-			return SR_ERR_ARG;
+		{
+			const int tries[] = { ds1000z_active_channels(sdi), 1, 2, 4 };
+			unsigned int t;
+			for (t = 0; t < ARRAY_SIZE(tries); t++) {
+				n = tries[t];
+				for (level = 0; level <= (int)ARRAY_SIZE(ds1000z_mem_depths); level++)
+					if (ds1000z_level_depth(level, n) == depth)
+						break;
+				if (level <= (int)ARRAY_SIZE(ds1000z_mem_depths))
+					break;
+			}
+			if (t == ARRAY_SIZE(tries))
+				return SR_ERR_ARG;
+		}
 		devc->mem_level = level;
+		devc->mem_req = depth;
 		return SR_OK;
 	}
 	case SR_CONF_TRIGGER_SWEEP:
