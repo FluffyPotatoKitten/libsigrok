@@ -736,6 +736,19 @@ static int rigol_ds_memory_depth(const struct sr_dev_inst *sdi)
 	return depth;
 }
 
+/*
+ * Points to request per :WAV:DATA? when the memory is read in blocks. The
+ * DS1000Z returns up to 250000 points per query in the BYTE format
+ * (programming guide); every query costs about 100 ms, so fewer and larger
+ * blocks are much faster.
+ */
+static int rigol_ds_block_points(const struct dev_context *devc)
+{
+	if (!strcmp(devc->model->series->name, "DS1000Z"))
+		return 250 * 1000;
+	return ACQ_BLOCK_SIZE;
+}
+
 /* Start capturing a new frameset */
 SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 {
@@ -1712,7 +1725,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 					devc->num_channel_bytes + 1) != SR_OK)
 				return TRUE;
 			if (set_range && rigol_ds_config_set(sdi, ":WAV:STOP %d",
-					MIN(devc->num_channel_bytes + ACQ_BLOCK_SIZE,
+					MIN(devc->num_channel_bytes + rigol_ds_block_points(devc),
 						devc->analog_frame_size)) != SR_OK)
 				return TRUE;
 		}

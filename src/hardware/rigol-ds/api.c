@@ -1369,13 +1369,13 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->v1_acquiring = protocol == PROTOCOL_V1;
 
 	/*
-	 * The receive callback reads one buffer per call. The VS5000 memory
-	 * (512K samples per channel) is read after the shot, when there is
-	 * nothing to wait for: poll fast, or one frame takes seconds.
+	 * The receive callback reads one buffer per call. Memory captures
+	 * (e.g. 512K samples per channel on the VS5000, up to 24M points on
+	 * the DS1000Z) are read after the shot: poll fast, or the poll
+	 * interval limits the speed (32 KB per 50 ms).
 	 */
 	sr_scpi_source_add(sdi->session, scpi, G_IO_IN,
-			(protocol == PROTOCOL_V1 &&
-			 devc->data_source == DATA_SOURCE_MEMORY) ? 2 : 50,
+			devc->data_source == DATA_SOURCE_LIVE ? 50 : 2,
 			rigol_ds_receive, (void *)sdi);
 
 	devc->channel_entry = devc->enabled_channels;
