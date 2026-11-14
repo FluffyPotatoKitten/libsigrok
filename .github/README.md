@@ -111,6 +111,9 @@ Example, 5 frames of the full memory over USB, as CSV:
 | `rigol-ds`: live with the Single sweep | One new single shot per live frame instead of the same waveform again |
 | `rigol-ds`: 250k point blocks | Read memory in blocks of 250000 points and poll fast |
 | `rigol-ds`: fewer `*OPC?` | No `*OPC?` after the block commands, fuller reads (much faster over LAN) |
+| `SR_CONF_TRIGGER_SWEEP` | The new config key (the same commit as on `rigol-vs5000`) |
+| `rigol-ds`: trigger sweep for V3 and later | Auto / Normal / Single for the DS2000, DS1000Z, DS4000 and MSO5000 (tested with the DS1000Z) |
+| `rigol-ds`: sample rate as meta | Send the sample rate of each capture: PulseView showed memory taken after live with the live rate |
 
 **Connection strings:**
 
@@ -121,6 +124,9 @@ Example, 3 frames of the full memory of CH1, as CSV:
 
     sigrok-cli -d rigol-ds:conn=usbtmc --channels CH1 \
         --config data_source=Memory --frames 3 -O csv -o capture.csv
+
+The trigger sweep (Auto, Normal, Single) can be set like the other options,
+also in PulseView. With Single, live capture takes a new shot per frame.
 
 A memory capture takes one single shot per frame. With the Normal or Single
 sweep it waits for a trigger; with the Auto sweep a trigger is forced when
@@ -138,7 +144,8 @@ none comes. The sweep and run state are restored afterwards. The memory depth
   SCPI over LAN (neither port 5555 nor VXI-11). Unplug USB and restart the
   scope to use LAN.
 - **One LAN client:** port 5555 serves one client at a time; close other
-  programs (e.g. DSRemote) first.
+  programs (e.g. DSRemote) first. Right after another client closed its
+  connection, the next one can occasionally get no answers; start again.
 - Over LAN the scope needs about 200 ms per command.
 
 ## Speed
