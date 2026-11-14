@@ -151,10 +151,10 @@ none comes. The sweep and run state are restored afterwards. The memory depth
 
 **Things to know about the DS1000Z firmware** (00.04.05.SP2 tested):
 
-- **USB at high speed:** the 64 byte endpoints are a firmware bug. Some USB
+- **USB High-Speed (480Mbit):** the 64 byte endpoints are a firmware bug. Some USB
   host controllers do not work with it at all, others deliver corrupted data
   for long messages. With this fork the data is correct at high speed (tested
-  in a VirtualBox VM). At full speed (e.g. behind a USB isolator) 64 bytes is
+  in a VirtualBox VM). At Full-Speed (12 Mbit) 64 bytes is
   valid.
 - **LAN only without USB:** while USB is connected, the scope does not answer
   SCPI over LAN (neither port 5555 nor VXI-11). Unplug USB and restart the
