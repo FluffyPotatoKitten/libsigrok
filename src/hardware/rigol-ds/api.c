@@ -74,6 +74,71 @@ static const uint32_t devopts_cg_analog[] = {
 	SR_CONF_PROBE_FACTOR | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
+/* DS1000Z: devopts_v3 plus the memory depth. */
+static const uint32_t devopts_ds1000z[] = {
+	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_NUM_HDIV | SR_CONF_GET,
+	SR_CONF_HORIZ_TRIGGERPOS | SR_CONF_SET,
+	SR_CONF_TRIGGER_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_BUFFERSIZE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+};
+
+/* DS1000Z: per channel also the input range given by V/div and offset. */
+static const uint32_t devopts_cg_analog_ds1000z[] = {
+	SR_CONF_NUM_VDIV | SR_CONF_GET,
+	SR_CONF_VDIV | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_COUPLING | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_PROBE_FACTOR | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_RANGE | SR_CONF_GET,
+};
+
+/*
+ * DS1000Z memory depths in points with one active channel; halved with
+ * two, quartered with three or four. 24M needs the memory option (the
+ * scope rejects it otherwise).
+ */
+static const uint64_t ds1000z_mem_depths[] = {
+	12000, 120000, 1200000, 12000000, 24000000,
+};
+
+static gboolean is_ds1000z(const struct dev_context *devc)
+{
+	return devc && !strcmp(devc->model->series->name, "DS1000Z");
+}
+
+/*
+ * DS1000Z input range of a channel: the BYTE samples are 25 codes per
+ * division, (code - 127) * V/div / 25 - offset, codes 0 to 255.
+ */
+static char *ds1000z_range_string(const struct dev_context *devc, int ch)
+{
+	double inc = devc->vdiv[ch] / 25.0;
+	double low = -127 * inc - devc->vert_offset[ch];
+	double high = 128 * inc - devc->vert_offset[ch];
+
+	if (fabs(low) < 1.0 && fabs(high) < 1.0)
+		return g_strdup_printf("%+.1f mV .. %+.1f mV", low * 1000, high * 1000);
+	return g_strdup_printf("%+.2f V .. %+.2f V", low, high);
+}
+
+/* Active channels as the scope counts them for the memory depth. */
+static int ds1000z_active_channels(const struct dev_context *devc)
+{
+	unsigned int i;
+	int n = 0;
+
+	for (i = 0; i < devc->model->analog_channels; i++)
+		if (devc->analog_channels[i])
+			n++;
+	return n ? n : 1;
+}
+
 static const uint64_t timebases[][2] = {
 	/* nanoseconds */
 	{ 1, 1000000000 },
@@ -613,6 +678,17 @@ static int config_get(uint32_t key, GVariant **data,
 			tmp_str = devc->trigger_source;
 		*data = g_variant_new_string(tmp_str);
 		break;
+	case SR_CONF_BUFFERSIZE:
+		if (!is_ds1000z(devc))
+			return SR_ERR_NA;
+		*data = g_variant_new_uint64(devc->mem_depth);
+		break;
+	case SR_CONF_RANGE:
+		if (!is_ds1000z(devc) || analog_channel < 0)
+			return SR_ERR_NA;
+		*data = g_variant_new_take_string(ds1000z_range_string(devc,
+			analog_channel));
+		break;
 	case SR_CONF_TRIGGER_SWEEP:
 		if (!devc->trigger_sweep)
 			return SR_ERR_NA;
@@ -718,6 +794,39 @@ static int config_set(uint32_t key, GVariant *data,
 	case SR_CONF_LIMIT_FRAMES:
 		devc->limit_frames = g_variant_get_uint64(data);
 		break;
+	case SR_CONF_BUFFERSIZE: {
+		uint64_t depth = g_variant_get_uint64(data), got;
+		char *buf = NULL;
+		gboolean stopped;
+		if (!is_ds1000z(devc))
+			return SR_ERR_NA;
+		/* The scope takes a new depth only while running. */
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
+			return SR_ERR;
+		stopped = buf && buf[0] == 'S';
+		g_free(buf);
+		if (stopped && rigol_ds_config_set(sdi, ":RUN") != SR_OK)
+			return SR_ERR;
+		if (depth)
+			ret = rigol_ds_config_set(sdi, ":ACQ:MDEP %" PRIu64, depth);
+		else
+			ret = rigol_ds_config_set(sdi, ":ACQ:MDEP AUTO");
+		if (ret == SR_OK)
+			ret = sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf);
+		if (stopped)
+			rigol_ds_config_set(sdi, ":STOP");
+		if (ret != SR_OK)
+			return SR_ERR;
+		got = g_ascii_strtoull(buf, NULL, 10);
+		g_free(buf);
+		devc->mem_depth = got;
+		if (got != depth) {
+			sr_err("Memory depth %" PRIu64 " not accepted (24M needs "
+				"the memory option and one channel).", depth);
+			return SR_ERR_ARG;
+		}
+		return SR_OK;
+	}
 	case SR_CONF_TRIGGER_SWEEP:
 		if (devc->model->series->protocol < PROTOCOL_V3)
 			return SR_ERR_NA;
@@ -847,6 +956,8 @@ static int config_list(uint32_t key, GVariant **data,
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
+		if (!cg && is_ds1000z(devc))
+			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_ds1000z);
 		if (!cg && devc && devc->model->series->protocol >= PROTOCOL_V3)
 			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_v3);
 		if (!cg)
@@ -859,7 +970,10 @@ static int config_list(uint32_t key, GVariant **data,
 		} else {
 			if (std_cg_idx(cg, devc->analog_groups, devc->model->analog_channels) < 0)
 				return SR_ERR_ARG;
-			*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog));
+			if (is_ds1000z(devc))
+				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog_ds1000z));
+			else
+				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog));
 			return SR_OK;
 		}
 		break;
@@ -895,6 +1009,20 @@ static int config_list(uint32_t key, GVariant **data,
 			return SR_ERR_ARG;
 		*data = g_variant_new_strv(devc->model->trigger_sources, devc->model->num_trigger_sources);
 		break;
+	case SR_CONF_BUFFERSIZE: {
+		uint64_t depths[1 + ARRAY_SIZE(ds1000z_mem_depths)];
+		int n, div;
+		unsigned int k;
+		if (!is_ds1000z(devc))
+			return SR_ERR_NA;
+		n = ds1000z_active_channels(devc);
+		div = n == 1 ? 1 : n == 2 ? 2 : 4;
+		depths[0] = 0;		/* AUTO */
+		for (k = 0; k < ARRAY_SIZE(ds1000z_mem_depths); k++)
+			depths[k + 1] = ds1000z_mem_depths[k] / div;
+		*data = std_gvar_array_u64(depths, ARRAY_SIZE(depths));
+		break;
+	}
 	case SR_CONF_TRIGGER_SWEEP:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_sweeps));
 		break;

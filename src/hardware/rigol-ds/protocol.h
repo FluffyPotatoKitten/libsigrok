@@ -141,6 +141,8 @@ struct dev_context {
 	char *trigger_slope;
 	/* Trigger sweep as the scope reports it (AUTO, NORM, SING), V3 and later. */
 	char *trigger_sweep;
+	/* DS1000Z: memory depth setting in points, 0 = AUTO (:ACQ:MDEP). */
+	uint64_t mem_depth;
 	float trigger_level;
 	char *coupling[MAX_ANALOG_CHANNELS];
 
