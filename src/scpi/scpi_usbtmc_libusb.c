@@ -641,9 +641,12 @@ static int scpi_usbtmc_libusb_read_begin(void *priv)
 	return SR_OK;
 }
 
-static int scpi_usbtmc_libusb_read_data(void *priv, char *buf, int maxlen)
+static int scpi_usbtmc_libusb_read_complete(void *priv);
+
+/* Read what the current transfer holds, fetching the next one if needed. */
+static int scpi_usbtmc_libusb_read_chunk(struct scpi_usbtmc_libusb *uscpi,
+	char *buf, int maxlen)
 {
-	struct scpi_usbtmc_libusb *uscpi = priv;
 	int read_length;
 
 	if (uscpi->response_bytes_read >= uscpi->response_length) {
@@ -666,6 +669,31 @@ static int scpi_usbtmc_libusb_read_data(void *priv, char *buf, int maxlen)
 	uscpi->response_bytes_read += read_length;
 
 	return read_length;
+}
+
+/*
+ * Fill the buffer across transfers and DEV_DEP_MSG_IN messages until it is
+ * full or the response is complete. Callers often read once per poll
+ * interval, so returning after every (possibly short) message makes large
+ * responses very slow.
+ */
+static int scpi_usbtmc_libusb_read_data(void *priv, char *buf, int maxlen)
+{
+	struct scpi_usbtmc_libusb *uscpi = priv;
+	int total, len;
+
+	total = 0;
+	while (total < maxlen) {
+		len = scpi_usbtmc_libusb_read_chunk(uscpi, buf + total,
+			maxlen - total);
+		if (len < 0)
+			return total ? total : len;
+		total += len;
+		if (len == 0 || scpi_usbtmc_libusb_read_complete(uscpi))
+			break;
+	}
+
+	return total;
 }
 
 static int scpi_usbtmc_libusb_read_complete(void *priv)
