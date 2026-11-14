@@ -560,11 +560,11 @@ static int scpi_usbtmc_bulkin_start(struct scpi_usbtmc_libusb *uscpi,
 			/*
 			 * The DEV_DEP_MSG_IN message is empty, and the TMC
 			 * spec says it should at least contain a header.
-			 * The Rigol DS1054Z seems to do this sometimes, and
-			 * it follows up with a valid message.  Give the device
-			 * one more chance to send a header.
+			 * The Rigol DS1054Z does this before many messages at
+			 * high speed, and it follows up with a valid message.
+			 * Give the device one more chance to send a header.
 			 */
-			sr_warn("USBTMC bulk in start was empty; retrying\n");
+			sr_dbg("USBTMC bulk in start was empty; retrying.");
 			continue;
 		}
 
