@@ -346,6 +346,7 @@ static void clear_helper(struct dev_context *devc)
 	g_free(devc->trigger_type);
 	g_slist_free_full(devc->v1_pending_cmds, g_free);
 	g_mutex_clear(&devc->v1_cmd_lock);
+	g_free(devc->saved_sweep);
 	g_free(devc->analog_groups);
 }
 
@@ -1315,6 +1316,30 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		g_free(v1_sweep);
 	}
 
+	/* Live capture with the SINGLE sweep: a new single shot per frame. */
+	devc->live_single = FALSE;
+	if (devc->data_source == DATA_SOURCE_LIVE && protocol >= PROTOCOL_V3) {
+		char *sweep = NULL;
+		if (sr_scpi_get_string(scpi, ":TRIG:SWE?", &sweep) == SR_OK && sweep)
+			devc->live_single = !g_ascii_strncasecmp(sweep, "SING", 4);
+		g_free(sweep);
+	}
+
+	/* Memory captures take single shots: remember what to restore. */
+	g_free(devc->saved_sweep);
+	devc->saved_sweep = NULL;
+	if (devc->data_source == DATA_SOURCE_MEMORY && protocol >= PROTOCOL_V3) {
+		char *status = NULL;
+		if (sr_scpi_get_string(scpi, ":TRIG:SWE?", &devc->saved_sweep) != SR_OK)
+			devc->saved_sweep = NULL;
+		devc->saved_running = sr_scpi_get_string(scpi, ":TRIG:STAT?",
+			&status) == SR_OK && status && status[0] != 'S';
+		g_free(status);
+		sr_dbg("Sweep %s, %s: restored after the capture.",
+			devc->saved_sweep ? devc->saved_sweep : "unknown",
+			devc->saved_running ? "running" : "stopped");
+	}
+
 	switch (devc->model->series->protocol) {
 	case PROTOCOL_V2:
 		if (rigol_ds_config_set(sdi, ":ACQ:MEMD LONG") != SR_OK)
@@ -1365,7 +1390,19 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->sample_rate = analog_frame_size(sdi) /
 			(devc->timebase * devc->model->series->num_horizontal_divs);
 	} else {
-		float xinc;
+		float xinc, srate;
+		/*
+		 * WAV:XINC? describes the waveform of the current :WAV:MODE,
+		 * which is still the screen (NORM) here: ask for the sample
+		 * rate of the memory directly where the scope reports it.
+		 */
+		if (devc->data_source == DATA_SOURCE_MEMORY &&
+				devc->model->series->protocol == PROTOCOL_V4 &&
+				sr_scpi_get_float(sdi->conn, ":ACQ:SRAT?", &srate) == SR_OK &&
+				srate > 0) {
+			devc->sample_rate = srate;
+			goto rate_done;
+		}
 		if (devc->model->series->protocol < PROTOCOL_V3) {
 			sr_err("Cannot get samplerate (below V3).");
 			return SR_ERR;
@@ -1381,6 +1418,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		}
 		devc->sample_rate = 1. / xinc;
 	}
+rate_done:
 
 	/* After the sample rate is known, outputs read it from the header. */
 	std_session_send_df_header(sdi);
@@ -1434,6 +1472,14 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 
 	g_slist_free(devc->enabled_channels);
 	devc->enabled_channels = NULL;
+
+	if (devc->saved_sweep) {
+		rigol_ds_config_set(sdi, ":TRIG:SWE %s", devc->saved_sweep);
+		g_free(devc->saved_sweep);
+		devc->saved_sweep = NULL;
+		if (devc->saved_running)
+			rigol_ds_config_set(sdi, ":RUN");
+	}
 
 	return SR_OK;
 }

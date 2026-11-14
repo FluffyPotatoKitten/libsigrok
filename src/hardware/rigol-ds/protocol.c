@@ -507,12 +507,58 @@ static int rigol_ds_v1_memory_wait(const struct sr_dev_inst *sdi)
 static int rigol_ds_stop_wait(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
+	int64_t now, force_at, give_up;
+	gboolean force;
+	char *buf, c;
 
 	if (devc->model->series->protocol == PROTOCOL_V1 &&
 			devc->data_source == DATA_SOURCE_MEMORY)
 		return rigol_ds_v1_memory_wait(sdi);
 
-	return rigol_ds_event_wait(sdi, 'S', 'S');
+	if (devc->data_source != DATA_SOURCE_MEMORY && !devc->live_single)
+		return rigol_ds_event_wait(sdi, 'S', 'S');
+
+	/*
+	 * Memory captures (and live captures with the SINGLE sweep) start a
+	 * single shot with :SING. Until the scope
+	 * has taken the command it still reports the stop of the previous
+	 * shot (for about 100 ms on the DS1000Z), so only a stop after a
+	 * non-stop status counts (or after a second, in case the shot was
+	 * too fast to see it running).
+	 *
+	 * With the Auto sweep the user expects a waveform without a trigger,
+	 * but a single shot waits for one: force a trigger when none came
+	 * within the screen time plus a margin.
+	 */
+	force = devc->saved_sweep &&
+		!g_ascii_strncasecmp(devc->saved_sweep, "AUTO", 4);
+	force_at = devc->single_start + 300000 + (int64_t)(1e6 *
+		devc->timebase * devc->model->series->num_horizontal_divs);
+	give_up = g_get_monotonic_time() + 2000000;
+	for (;;) {
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
+			return SR_ERR;
+		c = buf[0];
+		g_free(buf);
+		now = g_get_monotonic_time();
+		if (c != 'S') {
+			devc->single_running = TRUE;
+		} else if (devc->single_running ||
+				now - devc->single_start > 1000000) {
+			rigol_ds_set_wait_event(devc, WAIT_NONE);
+			return SR_OK;
+		}
+		if (force && !devc->single_forced && now > force_at) {
+			sr_dbg("No trigger with the Auto sweep, forcing one.");
+			if (rigol_ds_config_set(sdi, ":TFOR") != SR_OK)
+				return SR_ERR;
+			devc->single_forced = TRUE;
+		}
+		if (now > give_up)
+			/* Don't block the application, try again later. */
+			return SR_ERR_TIMEOUT;
+		g_usleep(10000);
+	}
 }
 
 /* Check that a single shot acquisition actually succeeded on the DS2000 */
@@ -657,6 +703,39 @@ SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *forma
 	}
 }
 
+/*
+ * Memory depth per channel of the current setting (V4: DS1000Z, DS4000).
+ * It can be chosen in the menu and depends on the number of active
+ * channels and on installed options (DS1000Z: 12M points, 24M with the
+ * memory option), so it is read from the scope. In the automatic setting
+ * the scope reports "AUTO" and uses sample rate x screen time.
+ * Returns the number of points, or 0 if it cannot be determined.
+ */
+static int rigol_ds_memory_depth(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	char *buf;
+	float srate;
+	int depth;
+
+	if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
+		return 0;
+	if (sr_atoi(buf, &depth) == SR_OK && depth > 0) {
+		g_free(buf);
+		sr_dbg("Memory depth %d points.", depth);
+		return depth;
+	}
+	sr_dbg("Memory depth '%s', computing it from the sample rate.", buf);
+	g_free(buf);
+	if (sr_scpi_get_float(sdi->conn, ":ACQ:SRAT?", &srate) != SR_OK ||
+			srate <= 0)
+		return 0;
+	depth = (int)(srate * devc->timebase *
+		devc->model->series->num_horizontal_divs + 0.5);
+	sr_dbg("Memory depth %d points (%g Sa/s).", depth, srate);
+	return depth;
+}
+
 /* Start capturing a new frameset */
 SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 {
@@ -737,7 +816,18 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 				return SR_ERR;
 			devc->analog_frame_size = devc->model->series->live_samples;
 			devc->digital_frame_size = devc->model->series->live_samples;
-			rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+			if (devc->live_single) {
+				/* The scope stops after each shot: take a new one
+				 * per frame instead of reading the same one again. */
+				if (rigol_ds_config_set(sdi, ":SING") != SR_OK)
+					return SR_ERR;
+				devc->single_start = g_get_monotonic_time();
+				devc->single_running = FALSE;
+				devc->single_forced = FALSE;
+				rigol_ds_set_wait_event(devc, WAIT_STOP);
+			} else {
+				rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+			}
 		} else {
 			if (devc->model->series->protocol == PROTOCOL_V3) {
 				if (first_frame && rigol_ds_config_set(sdi, ":WAV:MODE RAW") != SR_OK)
@@ -759,33 +849,30 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 					}
 				}
 
-				buffer_samples = devc->model->series->buffer_samples;
-				if (first_frame && buffer_samples == 0)
-				{
-					/* The DS4000 series does not have a fixed memory depth, it
-					 * can be chosen from the menu and also varies with number
-					 * of active channels. Retrieve the actual number with the
-					 * ACQ:MDEP command. */
-					sr_scpi_get_int(sdi->conn, "ACQ:MDEP?", &buffer_samples);
+				if (first_frame) {
+					buffer_samples = rigol_ds_memory_depth(sdi);
+					if (buffer_samples <= 0) {
+						/* Fall back to the series' maximum, shared by
+						 * the active channels. */
+						buffer_samples = devc->model->series->buffer_samples /
+							(num_channels == 1 ? 1 : num_channels == 2 ? 2 : 4);
+						sr_warn("Cannot get the memory depth, assuming %d points.",
+							buffer_samples);
+					}
 					devc->analog_frame_size = devc->digital_frame_size =
-							buffer_samples;
-				}
-				else if (first_frame)
-				{
-					/* The DS1000Z series has a fixed memory depth which we
-					 * need to divide correctly according to the number of
-					 * active channels. */
-					devc->analog_frame_size = devc->digital_frame_size =
-						num_channels == 1 ?
-							buffer_samples :
-								num_channels == 2 ?
-									buffer_samples / 2 :
-									buffer_samples / 4;
+						buffer_samples;
 				}
 			}
 
-			if (devc->data_source == DATA_SOURCE_LIVE && rigol_ds_config_set(sdi, ":SINGL") != SR_OK)
-				return SR_ERR;
+			/* Memory: one new single shot per frame. Segmented reads
+			 * the recorded frames, without a new acquisition. */
+			if (devc->data_source == DATA_SOURCE_MEMORY) {
+				if (rigol_ds_config_set(sdi, ":SING") != SR_OK)
+					return SR_ERR;
+				devc->single_start = g_get_monotonic_time();
+				devc->single_running = FALSE;
+				devc->single_forced = FALSE;
+			}
 			rigol_ds_set_wait_event(devc, WAIT_STOP);
 			if (devc->data_source == DATA_SOURCE_SEGMENTED &&
 					devc->model->series->protocol <= PROTOCOL_V4)
@@ -1614,11 +1701,17 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			devc->analog_frame_size : devc->digital_frame_size;
 
 	if (devc->num_block_bytes == 0) {
+		/*
+		 * Live frames always cover the same points. Memory is read in
+		 * blocks, each block of each frame needs its own range.
+		 */
+		const gboolean set_range = first_frame ||
+			devc->data_source != DATA_SOURCE_LIVE;
 		if (devc->model->series->protocol >= PROTOCOL_V4) {
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:START %d",
+			if (set_range && rigol_ds_config_set(sdi, ":WAV:START %d",
 					devc->num_channel_bytes + 1) != SR_OK)
 				return TRUE;
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:STOP %d",
+			if (set_range && rigol_ds_config_set(sdi, ":WAV:STOP %d",
 					MIN(devc->num_channel_bytes + ACQ_BLOCK_SIZE,
 						devc->analog_frame_size)) != SR_OK)
 				return TRUE;
@@ -1897,14 +1990,10 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			devc->num_frames_segmented = frames;
 		}
 
+		/* Memory takes a new single shot per frame, like live mode
+		 * it runs until the frame limit. */
 		if (devc->num_frames == devc->limit_frames ||
-				devc->num_frames == devc->num_frames_segmented ||
-				(devc->data_source == DATA_SOURCE_MEMORY &&
-				 devc->model->series->protocol != PROTOCOL_V1)) {
-			/*
-			 * The VS5000 takes a new single shot per frame, like
-			 * the live mode until the frame limit or a stop.
-			 */
+				devc->num_frames == devc->num_frames_segmented) {
 			/* Last frame, stop capture. */
 			sr_dev_acquisition_stop(sdi);
 		} else {

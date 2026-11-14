@@ -224,6 +224,20 @@ struct dev_context {
 	int v1_fw_patch;
 	/* VS5000 over LAN: a reconnect after out-of-step replies is pending. */
 	gboolean v1_resyncing;
+	/*
+	 * Memory capture (V3 and later): trigger sweep and run state at the
+	 * start (a single shot sets the sweep to SINGLE and stops the scope),
+	 * restored at the end; start of the current shot, whether the scope
+	 * was seen running in it and whether a trigger was forced in it
+	 * (Auto sweep).
+	 */
+	char *saved_sweep;
+	gboolean saved_running;
+	int64_t single_start;
+	gboolean single_running;
+	gboolean single_forced;
+	/* Live capture with the SINGLE sweep: one single shot per frame. */
+	gboolean live_single;
 };
 
 SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *format, ...);
