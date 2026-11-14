@@ -1619,9 +1619,13 @@ static int rigol_ds_v1_memory_packet(const struct sr_dev_inst *sdi, int len)
 		return SR_OK;
 	}
 	for (l = devc->enabled_channels, k = 0; l != devc->channel_entry;
-			l = l->next, k++)
+			l = l->next, k++) {
 		rigol_ds_v1_send_analog(sdi, l->data, devc->v1_mem +
 			k * frame + devc->num_channel_bytes, len);
+		/* The receiver may have stopped the acquisition. */
+		if (!devc->enabled_channels)
+			return SR_OK;
+	}
 	rigol_ds_v1_send_analog(sdi, devc->channel_entry->data,
 		devc->buffer, len);
 
