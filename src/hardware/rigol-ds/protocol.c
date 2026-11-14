@@ -333,6 +333,39 @@ SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *forma
 	}
 }
 
+/*
+ * Memory depth per channel of the current setting (V4: DS1000Z, DS4000).
+ * It can be chosen in the menu and depends on the number of active
+ * channels and on installed options (DS1000Z: 12M points, 24M with the
+ * memory option), so it is read from the scope. In the automatic setting
+ * the scope reports "AUTO" and uses sample rate x screen time.
+ * Returns the number of points, or 0 if it cannot be determined.
+ */
+static int rigol_ds_memory_depth(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	char *buf;
+	float srate;
+	int depth;
+
+	if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
+		return 0;
+	if (sr_atoi(buf, &depth) == SR_OK && depth > 0) {
+		g_free(buf);
+		sr_dbg("Memory depth %d points.", depth);
+		return depth;
+	}
+	sr_dbg("Memory depth '%s', computing it from the sample rate.", buf);
+	g_free(buf);
+	if (sr_scpi_get_float(sdi->conn, ":ACQ:SRAT?", &srate) != SR_OK ||
+			srate <= 0)
+		return 0;
+	depth = (int)(srate * devc->timebase *
+		devc->model->series->num_horizontal_divs + 0.5);
+	sr_dbg("Memory depth %d points (%g Sa/s).", depth, srate);
+	return depth;
+}
+
 /* Start capturing a new frameset */
 SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 {
@@ -414,28 +447,18 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 					}
 				}
 
-				buffer_samples = devc->model->series->buffer_samples;
-				if (first_frame && buffer_samples == 0)
-				{
-					/* The DS4000 series does not have a fixed memory depth, it
-					 * can be chosen from the menu and also varies with number
-					 * of active channels. Retrieve the actual number with the
-					 * ACQ:MDEP command. */
-					sr_scpi_get_int(sdi->conn, "ACQ:MDEP?", &buffer_samples);
+				if (first_frame) {
+					buffer_samples = rigol_ds_memory_depth(sdi);
+					if (buffer_samples <= 0) {
+						/* Fall back to the series' maximum, shared by
+						 * the active channels. */
+						buffer_samples = devc->model->series->buffer_samples /
+							(num_channels == 1 ? 1 : num_channels == 2 ? 2 : 4);
+						sr_warn("Cannot get the memory depth, assuming %d points.",
+							buffer_samples);
+					}
 					devc->analog_frame_size = devc->digital_frame_size =
-							buffer_samples;
-				}
-				else if (first_frame)
-				{
-					/* The DS1000Z series has a fixed memory depth which we
-					 * need to divide correctly according to the number of
-					 * active channels. */
-					devc->analog_frame_size = devc->digital_frame_size =
-						num_channels == 1 ?
-							buffer_samples :
-								num_channels == 2 ?
-									buffer_samples / 2 :
-									buffer_samples / 4;
+						buffer_samples;
 				}
 			}
 

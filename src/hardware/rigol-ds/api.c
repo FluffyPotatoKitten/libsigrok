@@ -1020,7 +1020,19 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->sample_rate = analog_frame_size(sdi) /
 			(devc->timebase * devc->model->series->num_horizontal_divs);
 	} else {
-		float xinc;
+		float xinc, srate;
+		/*
+		 * WAV:XINC? describes the waveform of the current :WAV:MODE,
+		 * which is still the screen (NORM) here: ask for the sample
+		 * rate of the memory directly where the scope reports it.
+		 */
+		if (devc->data_source == DATA_SOURCE_MEMORY &&
+				devc->model->series->protocol == PROTOCOL_V4 &&
+				sr_scpi_get_float(sdi->conn, ":ACQ:SRAT?", &srate) == SR_OK &&
+				srate > 0) {
+			devc->sample_rate = srate;
+			goto rate_done;
+		}
 		if (devc->model->series->protocol < PROTOCOL_V3) {
 			sr_err("Cannot get samplerate (below V3).");
 			return SR_ERR;
@@ -1036,6 +1048,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		}
 		devc->sample_rate = 1. / xinc;
 	}
+rate_done:
 
 	if (rigol_ds_capture_start(sdi) != SR_OK)
 		return SR_ERR;
