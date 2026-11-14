@@ -1034,7 +1034,13 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		if (rigol_ds_config_set(sdi, ":RUN") != SR_OK)
 			return SR_ERR;
 
-	sr_scpi_source_add(sdi->session, scpi, G_IO_IN, 50,
+	/*
+	 * The receive callback reads one buffer per call. Memory captures
+	 * read megabytes after the shot: poll fast, or the poll interval
+	 * limits the speed (32 KB per 50 ms).
+	 */
+	sr_scpi_source_add(sdi->session, scpi, G_IO_IN,
+			devc->data_source == DATA_SOURCE_LIVE ? 50 : 2,
 			rigol_ds_receive, (void *)sdi);
 
 	std_session_send_df_header(sdi);
