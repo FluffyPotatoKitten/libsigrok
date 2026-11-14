@@ -1448,8 +1448,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	 * switched and the sample rate is derived from the timebase. Takes
 	 * about 30 ms on a DS1000Z. The VS5000 has no controls of its own.
 	 */
-	if (protocol != PROTOCOL_V1 && rigol_ds_get_dev_cfg(sdi) != SR_OK)
-		return SR_ERR;
+	if (protocol != PROTOCOL_V1) {
+		devc->block_pending = FALSE;
+		if (rigol_ds_get_dev_cfg(sdi) != SR_OK)
+			return SR_ERR;
+	}
 
 	some_digital = FALSE;
 	for (l = sdi->channels; l; l = l->next) {
@@ -1780,6 +1783,10 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 
 	g_slist_free(devc->enabled_channels);
 	devc->enabled_channels = NULL;
+
+	/* Stopped in the middle of a data block: clear the connection. */
+	if (devc->model->series->protocol != PROTOCOL_V1)
+		rigol_ds_drain_block(sdi);
 
 	if (devc->saved_sweep) {
 		rigol_ds_config_set(sdi, ":TRIG:SWE %s", devc->saved_sweep);

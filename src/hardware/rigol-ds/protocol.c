@@ -1628,6 +1628,54 @@ static int rigol_ds_v1_memory_packet(const struct sr_dev_inst *sdi, int len)
 	return SR_OK;
 }
 
+/*
+ * Read and drop the rest of a :WAV:DATA? reply, when an acquisition stops
+ * in the middle of a data block. Left in the connection, it would be taken
+ * as the answer to the next query (e.g. reading the settings at the next
+ * start). At most one block, about 0.1 s over LAN, 0.3 s over USB.
+ */
+SR_PRIV void rigol_ds_drain_block(struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	struct sr_scpi_dev_inst *scpi = sdi->conn;
+	char *buf = (char *)devc->buffer;
+	int64_t deadline;
+	int ret, left;
+
+	if (!devc->block_pending)
+		return;
+	sr_dbg("Reading the rest of an interrupted data block.");
+	deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+	/* The header, if it has not been read completely. */
+	while (devc->num_block_bytes == 0) {
+		if (g_get_monotonic_time() > deadline)
+			goto done;
+		ret = rigol_ds_read_header(sdi);
+		if (ret < 0)
+			goto done;
+		if (ret > 0) {
+			devc->num_block_bytes = ret;
+			devc->num_block_read = 0;
+		} else if (devc->num_header_bytes >= 2 &&
+				devc->num_header_bytes == (uint64_t)(2 + buf[1] - '0')) {
+			break;		/* An empty block. */
+		}
+	}
+	/* The data and the terminating linefeed. */
+	left = devc->num_block_bytes - devc->num_block_read + 1;
+	while (left > 0 && g_get_monotonic_time() < deadline) {
+		ret = sr_scpi_read_data(scpi, buf, MIN(left, ACQ_BUFFER_SIZE));
+		if (ret < 0)
+			break;
+		left -= ret;
+	}
+done:
+	devc->block_pending = FALSE;
+	devc->num_header_bytes = 0;
+	devc->num_block_bytes = 0;
+	devc->num_block_read = 0;
+}
+
 SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 {
 	struct sr_dev_inst *sdi;
@@ -1753,11 +1801,13 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 				return TRUE;
 			if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
 				return TRUE;
+			devc->block_pending = TRUE;
 		} else if (devc->model->series->protocol == PROTOCOL_V3) {
 			if (rigol_ds_config_set(sdi, ":WAV:BEG") != SR_OK)
 				return TRUE;
 			if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
 				return TRUE;
+			devc->block_pending = TRUE;
 		}
 
 		if (devc->model->series->protocol == PROTOCOL_V1) {
@@ -1800,6 +1850,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 				sr_dbg("Discarding short data block: got %d/%d bytes\n", len, (int)expected_data_bytes);
 				sr_scpi_read_data(scpi, (char *)devc->buffer, len + 1);
 				devc->num_header_bytes = 0;
+				devc->block_pending = FALSE;
 				return TRUE;
 			}
 			devc->num_block_bytes = len;
@@ -1960,12 +2011,17 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 		sr_session_send(sdi, &packet);
 	}
 
+	/* The receiver of the packet may have stopped the acquisition. */
+	if (!devc->enabled_channels)
+		return TRUE;
+
 	if (devc->num_block_read == devc->num_block_bytes) {
 		sr_dbg("Block has been completed");
 		if (devc->model->series->protocol >= PROTOCOL_V3) {
 			/* Discard the terminating linefeed */
 			sr_scpi_read_data(scpi, (char *)devc->buffer, 1);
 		}
+		devc->block_pending = FALSE;
 		if (devc->format == FORMAT_IEEE488_2) {
 			/* Prepare for possible next block */
 			devc->num_header_bytes = 0;
@@ -2040,6 +2096,8 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 	} else {
 		/* Done with this frame. */
 		std_session_send_df_frame_end(sdi);
+		if (!devc->enabled_channels)
+			return TRUE;
 
 		devc->num_frames++;
 

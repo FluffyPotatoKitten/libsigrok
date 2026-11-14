@@ -201,6 +201,8 @@ struct dev_context {
 	uint64_t num_block_bytes;
 	/* Number of data block bytes already read */
 	uint64_t num_block_read;
+	/* A :WAV:DATA? reply has not been read completely yet. */
+	gboolean block_pending;
 	/* What to wait for in *_receive */
 	enum wait_events wait_event;
 	/* Trigger/block copying/stop waiting status */
@@ -260,6 +262,7 @@ SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *forma
 SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi);
 SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi);
 SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data);
+SR_PRIV void rigol_ds_drain_block(struct sr_dev_inst *sdi);
 SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi);
 SR_PRIV int rigol_ds_get_dev_cfg_vertical(const struct sr_dev_inst *sdi);
 SR_PRIV double rigol_ds_v1_record_divs(const struct dev_context *devc);
