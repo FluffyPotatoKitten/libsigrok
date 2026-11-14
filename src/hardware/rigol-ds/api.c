@@ -603,6 +603,7 @@ static struct sr_dev_inst *probe_device(struct sr_scpi_dev_inst *scpi)
 	sdi->serial_num = g_strdup(hw_info->serial_number);
 	devc = g_malloc0(sizeof(struct dev_context));
 	g_mutex_init(&devc->v1_cmd_lock);
+	devc->mem_level = -1;	/* no memory depth chosen */
 	devc->limit_frames = 0;
 	devc->model = model;
 	devc->format = model->series->format;
@@ -1440,6 +1441,15 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	devc->num_frames = 0;
 	devc->num_frames_segmented = 0;
+
+	/*
+	 * The settings may have been changed on the scope (knobs, menus)
+	 * since they were read: read them again, before the channels are
+	 * switched and the sample rate is derived from the timebase. Takes
+	 * about 30 ms on a DS1000Z. The VS5000 has no controls of its own.
+	 */
+	if (protocol != PROTOCOL_V1 && rigol_ds_get_dev_cfg(sdi) != SR_OK)
+		return SR_ERR;
 
 	some_digital = FALSE;
 	for (l = sdi->channels; l; l = l->next) {
