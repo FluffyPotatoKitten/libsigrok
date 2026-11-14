@@ -1519,9 +1519,13 @@ static int rigol_ds_v1_memory_packet(const struct sr_dev_inst *sdi, int len)
 		return SR_OK;
 	}
 	for (l = devc->enabled_channels, k = 0; l != devc->channel_entry;
-			l = l->next, k++)
+			l = l->next, k++) {
 		rigol_ds_v1_send_analog(sdi, l->data, devc->v1_mem +
 			k * frame + devc->num_channel_bytes, len);
+		/* The receiver may have stopped the acquisition. */
+		if (!devc->enabled_channels)
+			return SR_OK;
+	}
 	rigol_ds_v1_send_analog(sdi, devc->channel_entry->data,
 		devc->buffer, len);
 
@@ -1809,6 +1813,10 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 		sr_session_send(sdi, &packet);
 	}
 
+	/* The receiver of the packet may have stopped the acquisition. */
+	if (!devc->enabled_channels)
+		return TRUE;
+
 	if (devc->num_block_read == devc->num_block_bytes) {
 		sr_dbg("Block has been completed");
 		if (devc->model->series->protocol >= PROTOCOL_V3) {
@@ -1881,6 +1889,8 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 	} else {
 		/* Done with this frame. */
 		std_session_send_df_frame_end(sdi);
+		if (!devc->enabled_channels)
+			return TRUE;
 
 		devc->num_frames++;
 
