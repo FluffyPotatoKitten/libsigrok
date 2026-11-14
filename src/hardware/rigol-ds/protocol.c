@@ -1721,17 +1721,25 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 		const gboolean set_range = first_frame ||
 			devc->data_source != DATA_SOURCE_LIVE;
 		/*
-		 * The range takes effect in command order, the *OPC? after
-		 * :WAV:BEG below covers it. Each *OPC? costs the DS1000Z about
-		 * 50 ms over USB and 150 ms over LAN.
+		 * The range takes effect in command order, no *OPC? needed
+		 * (it costs the DS1000Z about 50 ms over USB and 150 ms over
+		 * LAN). A start past the current stop point moves the stop
+		 * point and shows "Stop point changed!" on the DS1000Z: when
+		 * the range moves forward (every block after the first of a
+		 * channel), set the stop point first.
 		 */
-		if (devc->model->series->protocol >= PROTOCOL_V4) {
-			if (set_range && sr_scpi_send(sdi->conn, ":WAV:START %d",
-					devc->num_channel_bytes + 1) != SR_OK)
+		const int start = devc->num_channel_bytes + 1;
+		const int stop = MIN(devc->num_channel_bytes +
+			rigol_ds_block_points(devc), devc->analog_frame_size);
+		const gboolean forward = devc->num_channel_bytes > 0;
+		if (devc->model->series->protocol >= PROTOCOL_V4 && set_range) {
+			if (forward && sr_scpi_send(sdi->conn, ":WAV:STOP %d",
+					stop) != SR_OK)
 				return TRUE;
-			if (set_range && sr_scpi_send(sdi->conn, ":WAV:STOP %d",
-					MIN(devc->num_channel_bytes + rigol_ds_block_points(devc),
-						devc->analog_frame_size)) != SR_OK)
+			if (sr_scpi_send(sdi->conn, ":WAV:START %d", start) != SR_OK)
+				return TRUE;
+			if (!forward && sr_scpi_send(sdi->conn, ":WAV:STOP %d",
+					stop) != SR_OK)
 				return TRUE;
 		}
 
