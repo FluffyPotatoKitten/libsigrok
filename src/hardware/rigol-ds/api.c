@@ -53,6 +53,20 @@ static const uint32_t devopts[] = {
 	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
+/* V3 and later: devopts plus the trigger sweep. */
+static const uint32_t devopts_v3[] = {
+	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_NUM_HDIV | SR_CONF_GET,
+	SR_CONF_HORIZ_TRIGGERPOS | SR_CONF_SET,
+	SR_CONF_TRIGGER_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+};
+
 static const uint32_t devopts_cg_analog[] = {
 	SR_CONF_NUM_VDIV | SR_CONF_GET,
 	SR_CONF_VDIV | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
@@ -142,6 +156,15 @@ static const char *trigger_sources_4_chans[] = {
 
 static const char *trigger_slopes[] = {
 	"r", "f",
+};
+
+/* Trigger sweeps, and how the scope names them (it answers NORM, SING). */
+static const char *trigger_sweeps[] = {
+	"Auto", "Normal", "Single",
+};
+
+static const char *trigger_sweeps_scpi[] = {
+	"AUTO", "NORMAL", "SINGLE",
 };
 
 static const char *coupling[] = {
@@ -307,6 +330,7 @@ static void clear_helper(struct dev_context *devc)
 		g_free(devc->coupling[i]);
 	g_free(devc->trigger_source);
 	g_free(devc->trigger_slope);
+	g_free(devc->trigger_sweep);
 	g_free(devc->saved_sweep);
 	g_free(devc->analog_groups);
 }
@@ -589,6 +613,19 @@ static int config_get(uint32_t key, GVariant **data,
 			tmp_str = devc->trigger_source;
 		*data = g_variant_new_string(tmp_str);
 		break;
+	case SR_CONF_TRIGGER_SWEEP:
+		if (!devc->trigger_sweep)
+			return SR_ERR_NA;
+		for (i = 0; i < ARRAY_SIZE(trigger_sweeps); i++)
+			if (!g_ascii_strncasecmp(devc->trigger_sweep,
+					trigger_sweeps_scpi[i], 4))
+				break;
+		if (i == ARRAY_SIZE(trigger_sweeps)) {
+			sr_dbg("Unknown trigger sweep: '%s'.", devc->trigger_sweep);
+			return SR_ERR_NA;
+		}
+		*data = g_variant_new_string(trigger_sweeps[i]);
+		break;
 	case SR_CONF_TRIGGER_SLOPE:
 		if (!strncmp(devc->trigger_slope, "POS", 3)) {
 			tmp_str = "r";
@@ -681,6 +718,19 @@ static int config_set(uint32_t key, GVariant *data,
 	case SR_CONF_LIMIT_FRAMES:
 		devc->limit_frames = g_variant_get_uint64(data);
 		break;
+	case SR_CONF_TRIGGER_SWEEP:
+		if (devc->model->series->protocol < PROTOCOL_V3)
+			return SR_ERR_NA;
+		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(trigger_sweeps))) < 0)
+			return SR_ERR_ARG;
+		ret = rigol_ds_config_set(sdi, ":TRIG:SWE %s", trigger_sweeps_scpi[idx]);
+		if (ret != SR_OK)
+			return ret;
+		g_free(devc->trigger_sweep);
+		devc->trigger_sweep = g_strdup(trigger_sweeps_scpi[idx]);
+		/* Live capture with SINGLE takes a new shot per frame. */
+		devc->live_single = idx == 2;
+		return SR_OK;
 	case SR_CONF_TRIGGER_SLOPE:
 		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(trigger_slopes))) < 0)
 			return SR_ERR_ARG;
@@ -797,6 +847,8 @@ static int config_list(uint32_t key, GVariant **data,
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
+		if (!cg && devc && devc->model->series->protocol >= PROTOCOL_V3)
+			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_v3);
 		if (!cg)
 			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
 		if (!devc)
@@ -842,6 +894,9 @@ static int config_list(uint32_t key, GVariant **data,
 			/* Can't know this until we have the exact model. */
 			return SR_ERR_ARG;
 		*data = g_variant_new_strv(devc->model->trigger_sources, devc->model->num_trigger_sources);
+		break;
+	case SR_CONF_TRIGGER_SWEEP:
+		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_sweeps));
 		break;
 	case SR_CONF_TRIGGER_SLOPE:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_slopes));

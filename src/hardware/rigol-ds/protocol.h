@@ -139,6 +139,8 @@ struct dev_context {
 	char *trigger_source;
 	float horiz_triggerpos;
 	char *trigger_slope;
+	/* Trigger sweep as the scope reports it (AUTO, NORM, SING), V3 and later. */
+	char *trigger_sweep;
 	float trigger_level;
 	char *coupling[MAX_ANALOG_CHANNELS];
 
