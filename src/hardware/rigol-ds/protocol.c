@@ -776,17 +776,32 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 		 */
 		const gboolean set_range = first_frame ||
 			devc->data_source != DATA_SOURCE_LIVE;
+		/*
+		 * The range takes effect in command order, the *OPC? after
+		 * :WAV:BEG below covers it. Each *OPC? costs the DS1000Z about
+		 * 50 ms over USB and 150 ms over LAN.
+		 */
 		if (devc->model->series->protocol >= PROTOCOL_V4) {
-			if (set_range && rigol_ds_config_set(sdi, ":WAV:START %d",
+			if (set_range && sr_scpi_send(sdi->conn, ":WAV:START %d",
 					devc->num_channel_bytes + 1) != SR_OK)
 				return TRUE;
-			if (set_range && rigol_ds_config_set(sdi, ":WAV:STOP %d",
+			if (set_range && sr_scpi_send(sdi->conn, ":WAV:STOP %d",
 					MIN(devc->num_channel_bytes + rigol_ds_block_points(devc),
 						devc->analog_frame_size)) != SR_OK)
 				return TRUE;
 		}
 
-		if (devc->model->series->protocol >= PROTOCOL_V3) {
+		/*
+		 * V4 and later: :WAV:DATA? is answered after the commands
+		 * before it, no *OPC? needed (it costs the DS1000Z 50 ms over
+		 * USB and 200 ms over LAN per block).
+		 */
+		if (devc->model->series->protocol >= PROTOCOL_V4) {
+			if (sr_scpi_send(sdi->conn, ":WAV:BEG") != SR_OK)
+				return TRUE;
+			if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
+				return TRUE;
+		} else if (devc->model->series->protocol == PROTOCOL_V3) {
 			if (rigol_ds_config_set(sdi, ":WAV:BEG") != SR_OK)
 				return TRUE;
 			if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
@@ -833,7 +848,28 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 		len = ACQ_BUFFER_SIZE;
 	sr_dbg("Requesting read of %d bytes", len);
 
-	len = sr_scpi_read_data(scpi, (char *)devc->buffer, len);
+	if (devc->data_source == DATA_SOURCE_LIVE) {
+		len = sr_scpi_read_data(scpi, (char *)devc->buffer, len);
+	} else {
+		/*
+		 * Memory: fill the buffer. A TCP read returns one segment
+		 * (1460 bytes), one read per poll interval is too slow.
+		 */
+		int want = len, n;
+		len = 0;
+		while (len < want) {
+			n = sr_scpi_read_data(scpi, (char *)devc->buffer + len,
+				want - len);
+			if (n < 0) {
+				if (!len)
+					len = -1;
+				break;
+			}
+			if (n == 0)
+				break;
+			len += n;
+		}
+	}
 
 	if (len == -1) {
 		sr_err("Error while reading block data, aborting capture.");
