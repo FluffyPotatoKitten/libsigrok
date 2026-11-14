@@ -1140,8 +1140,13 @@ SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
 		char *buf;
 		if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
 			return SR_ERR;
+		/*
+		 * The scope's depth changed since the last read (e.g. in its
+		 * menu): it replaces a depth chosen through the driver.
+		 */
+		if (g_ascii_strtoull(buf, NULL, 10) != devc->mem_depth)
+			devc->mem_level = -1;
 		devc->mem_depth = g_ascii_strtoull(buf, NULL, 10);
-		devc->mem_level = -1;
 		sr_dbg("Current memory depth %s", buf);
 		g_free(buf);
 	}
