@@ -1135,6 +1135,14 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->sample_rate = 1. / xinc;
 	}
 rate_done:
+	/*
+	 * The header went out before the rate was known, and a frontend
+	 * may have read the rate of an earlier capture (e.g. live before
+	 * memory): send the rate of this one.
+	 */
+	if (devc->sample_rate > 0)
+		sr_session_send_meta(sdi, SR_CONF_SAMPLERATE,
+			g_variant_new_uint64(devc->sample_rate));
 
 	if (rigol_ds_capture_start(sdi) != SR_OK)
 		return SR_ERR;
