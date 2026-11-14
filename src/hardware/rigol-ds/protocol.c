@@ -211,11 +211,12 @@ static int rigol_ds_stop_wait(const struct sr_dev_inst *sdi)
 	gboolean force;
 	char *buf, c;
 
-	if (devc->data_source != DATA_SOURCE_MEMORY)
+	if (devc->data_source != DATA_SOURCE_MEMORY && !devc->live_single)
 		return rigol_ds_event_wait(sdi, 'S', 'S');
 
 	/*
-	 * Memory captures start a single shot with :SING. Until the scope
+	 * Memory captures (and live captures with the SINGLE sweep) start a
+	 * single shot with :SING. Until the scope
 	 * has taken the command it still reports the stop of the previous
 	 * shot (for about 100 ms on the DS1000Z), so only a stop after a
 	 * non-stop status counts (or after a second, in case the shot was
@@ -472,7 +473,18 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 				return SR_ERR;
 			devc->analog_frame_size = devc->model->series->live_samples;
 			devc->digital_frame_size = devc->model->series->live_samples;
-			rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+			if (devc->live_single) {
+				/* The scope stops after each shot: take a new one
+				 * per frame instead of reading the same one again. */
+				if (rigol_ds_config_set(sdi, ":SING") != SR_OK)
+					return SR_ERR;
+				devc->single_start = g_get_monotonic_time();
+				devc->single_running = FALSE;
+				devc->single_forced = FALSE;
+				rigol_ds_set_wait_event(devc, WAIT_STOP);
+			} else {
+				rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+			}
 		} else {
 			if (devc->model->series->protocol == PROTOCOL_V3) {
 				if (first_frame && rigol_ds_config_set(sdi, ":WAV:MODE RAW") != SR_OK)

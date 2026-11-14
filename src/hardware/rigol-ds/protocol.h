@@ -175,6 +175,8 @@ struct dev_context {
 	int64_t single_start;
 	gboolean single_running;
 	gboolean single_forced;
+	/* Live capture with the SINGLE sweep: one single shot per frame. */
+	gboolean live_single;
 };
 
 SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *format, ...);

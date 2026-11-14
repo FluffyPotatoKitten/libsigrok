@@ -985,6 +985,15 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->analog_frame_size = analog_frame_size(sdi);
 	devc->digital_frame_size = digital_frame_size(sdi);
 
+	/* Live capture with the SINGLE sweep: a new single shot per frame. */
+	devc->live_single = FALSE;
+	if (devc->data_source == DATA_SOURCE_LIVE && protocol >= PROTOCOL_V3) {
+		char *sweep = NULL;
+		if (sr_scpi_get_string(scpi, ":TRIG:SWE?", &sweep) == SR_OK && sweep)
+			devc->live_single = !g_ascii_strncasecmp(sweep, "SING", 4);
+		g_free(sweep);
+	}
+
 	/* Memory captures take single shots: remember what to restore. */
 	g_free(devc->saved_sweep);
 	devc->saved_sweep = NULL;
