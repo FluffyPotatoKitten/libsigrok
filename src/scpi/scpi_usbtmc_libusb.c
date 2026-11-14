@@ -28,6 +28,8 @@
 
 #define MAX_TRANSFER_LENGTH 2048
 #define TRANSFER_TIMEOUT 1000
+/* Stream reading: bulk IN transfers kept in flight at most. */
+#define STREAM_TRANSFERS 16
 
 struct scpi_usbtmc_libusb {
 	struct sr_context *ctx;
@@ -45,6 +47,15 @@ struct scpi_usbtmc_libusb {
 	uint8_t buffer[MAX_TRANSFER_LENGTH];
 	uint16_t bulk_in_max_packet;
 	int32_t max_in_message;
+	/* Stream reading, see scpi_usbtmc_stream_fill(). */
+	gboolean stream;
+	struct libusb_transfer *xfer[STREAM_TRANSFERS];
+	int xfer_done[STREAM_TRANSFERS];
+	int xfer_head, xfer_count;
+	uint8_t *fifo;
+	size_t fifo_start, fifo_end;
+	/* Current message: size with header (0 = header not seen yet), received. */
+	size_t msg_total, msg_received;
 	int response_length;
 	int response_bytes_read;
 	int remaining_length;
@@ -376,6 +387,12 @@ static int scpi_usbtmc_libusb_open(struct sr_scpi_dev_inst *scpi)
 		sr_info("Bulk IN EP has a max packet size of %d bytes at high "
 			"speed (must be 512); limiting messages to %d bytes.",
 			uscpi->bulk_in_max_packet, uscpi->max_in_message);
+		/*
+		 * Each transfer of such a device ends after one 64 byte
+		 * packet. Read with transfers kept in flight, so the device
+		 * is polled without gaps (also between the short messages).
+		 */
+		uscpi->stream = TRUE;
 	}
 
 	if (libusb_kernel_driver_active(usb->devhdl, uscpi->interface) == 1) {
@@ -624,9 +641,267 @@ static int scpi_usbtmc_libusb_send(void *priv, const char *command)
 	return SR_OK;
 }
 
+/*
+ * Stream reading, for devices whose every bulk IN transfer ends after one
+ * short packet (see scpi_usbtmc_libusb_open()). Reading one transfer at a
+ * time leaves a gap after every packet in which the device is not polled:
+ * the Rigol DS1000Z then reaches about 0.5 MB/s at high speed. Here up to
+ * STREAM_TRANSFERS transfers of one packet each are kept in flight while a
+ * message is read, and the received bytes are consumed in order from a
+ * FIFO. Only as many transfers are queued as the rest of the message can
+ * fill, so none is left over to cancel: cancelling is slow, and while the
+ * device sends it can lose a packet.
+ */
+static void LIBUSB_CALL scpi_usbtmc_stream_cb(struct libusb_transfer *transfer)
+{
+	*(int *)transfer->user_data = 1;
+}
+
+static void scpi_usbtmc_stream_cancel(struct scpi_usbtmc_libusb *uscpi)
+{
+	int i, slot;
+
+	for (i = 0; i < uscpi->xfer_count; i++) {
+		slot = (uscpi->xfer_head + i) % STREAM_TRANSFERS;
+		if (!uscpi->xfer_done[slot])
+			libusb_cancel_transfer(uscpi->xfer[slot]);
+	}
+	for (i = 0; i < uscpi->xfer_count; i++) {
+		slot = (uscpi->xfer_head + i) % STREAM_TRANSFERS;
+		while (!uscpi->xfer_done[slot])
+			libusb_handle_events_completed(uscpi->ctx->libusb_ctx,
+				&uscpi->xfer_done[slot]);
+	}
+	uscpi->xfer_head = uscpi->xfer_count = 0;
+	uscpi->fifo_start = uscpi->fifo_end = 0;
+}
+
+static void scpi_usbtmc_stream_free(struct scpi_usbtmc_libusb *uscpi)
+{
+	int i;
+
+	scpi_usbtmc_stream_cancel(uscpi);
+	for (i = 0; i < STREAM_TRANSFERS; i++) {
+		if (!uscpi->xfer[i])
+			continue;
+		g_free(uscpi->xfer[i]->buffer);
+		libusb_free_transfer(uscpi->xfer[i]);
+		uscpi->xfer[i] = NULL;
+	}
+	g_free(uscpi->fifo);
+	uscpi->fifo = NULL;
+}
+
+/* Keep STREAM_TRANSFERS transfers in flight. */
+static int scpi_usbtmc_stream_submit(struct scpi_usbtmc_libusb *uscpi)
+{
+	struct libusb_transfer *transfer;
+	int slot, ret;
+
+	size_t expect;
+
+	/* Before the header is in, one packet. */
+	expect = uscpi->msg_total ? uscpi->msg_total : 1;
+	while (uscpi->xfer_count < STREAM_TRANSFERS &&
+			uscpi->msg_received + uscpi->xfer_count *
+			(size_t)uscpi->bulk_in_max_packet < expect) {
+		slot = (uscpi->xfer_head + uscpi->xfer_count) % STREAM_TRANSFERS;
+		if (!uscpi->xfer[slot]) {
+			if (!(uscpi->xfer[slot] = libusb_alloc_transfer(0)))
+				return SR_ERR_MALLOC;
+			uscpi->xfer[slot]->buffer = g_malloc(uscpi->bulk_in_max_packet);
+		}
+		transfer = uscpi->xfer[slot];
+		uscpi->xfer_done[slot] = 0;
+		libusb_fill_bulk_transfer(transfer, uscpi->usb->devhdl,
+			uscpi->bulk_in_ep, transfer->buffer, uscpi->bulk_in_max_packet,
+			scpi_usbtmc_stream_cb, &uscpi->xfer_done[slot],
+			TRANSFER_TIMEOUT);
+		if ((ret = libusb_submit_transfer(transfer)) < 0) {
+			sr_err("USBTMC bulk in submit error: %s.",
+			       libusb_error_name(ret));
+			uscpi->xfer_done[slot] = 1;
+			return SR_ERR;
+		}
+		uscpi->xfer_count++;
+	}
+
+	return SR_OK;
+}
+
+/* Wait until the FIFO holds at least need bytes. */
+static int scpi_usbtmc_stream_fill(struct scpi_usbtmc_libusb *uscpi,
+	size_t need)
+{
+	struct libusb_transfer *transfer;
+	size_t len;
+	int slot;
+
+	if (!uscpi->fifo)
+		uscpi->fifo = g_malloc(MAX_TRANSFER_LENGTH +
+			STREAM_TRANSFERS * uscpi->bulk_in_max_packet);
+
+	while (uscpi->fifo_end - uscpi->fifo_start < need) {
+		if (scpi_usbtmc_stream_submit(uscpi) != SR_OK)
+			return SR_ERR;
+		if (!uscpi->xfer_count) {
+			sr_err("USBTMC message ended early.");
+			return SR_ERR;
+		}
+		slot = uscpi->xfer_head;
+		while (!uscpi->xfer_done[slot])
+			libusb_handle_events_completed(uscpi->ctx->libusb_ctx,
+				&uscpi->xfer_done[slot]);
+		transfer = uscpi->xfer[slot];
+		uscpi->xfer_head = (slot + 1) % STREAM_TRANSFERS;
+		uscpi->xfer_count--;
+		if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+			sr_err("USBTMC bulk in transfer error: %s.",
+			       libusb_error_name(transfer->status ==
+					LIBUSB_TRANSFER_TIMED_OUT ?
+					LIBUSB_ERROR_TIMEOUT : LIBUSB_ERROR_IO));
+			return SR_ERR;
+		}
+		len = transfer->actual_length;
+		if (uscpi->fifo_start) {
+			memmove(uscpi->fifo, uscpi->fifo + uscpi->fifo_start,
+				uscpi->fifo_end - uscpi->fifo_start);
+			uscpi->fifo_end -= uscpi->fifo_start;
+			uscpi->fifo_start = 0;
+		}
+		memcpy(uscpi->fifo + uscpi->fifo_end, transfer->buffer, len);
+		uscpi->fifo_end += len;
+		uscpi->msg_received += len;
+	}
+
+	return SR_OK;
+}
+
+/*
+ * Stop the transfers in flight between two reads, keeping what they
+ * received (in order) for the next read. Transfers in flight between reads
+ * stalled the session. Cancelling a transfer while the device sends can
+ * lose a packet, so first receive the rest of the current message (at most
+ * one message of max_in_message bytes): then the device sends nothing
+ * until the next request, and the transfers still in flight are idle.
+ */
+static void scpi_usbtmc_stream_pause(struct scpi_usbtmc_libusb *uscpi)
+{
+	struct libusb_transfer *transfer;
+	int i, slot;
+	size_t len;
+
+	if (uscpi->remaining_length > 0 && scpi_usbtmc_stream_fill(uscpi,
+			uscpi->fifo_end - uscpi->fifo_start +
+			(uscpi->msg_total - uscpi->msg_received)) != SR_OK) {
+		scpi_usbtmc_stream_cancel(uscpi);
+		return;
+	}
+	for (i = 0; i < uscpi->xfer_count; i++) {
+		slot = (uscpi->xfer_head + i) % STREAM_TRANSFERS;
+		if (!uscpi->xfer_done[slot])
+			libusb_cancel_transfer(uscpi->xfer[slot]);
+	}
+	if (uscpi->fifo_start) {
+		memmove(uscpi->fifo, uscpi->fifo + uscpi->fifo_start,
+			uscpi->fifo_end - uscpi->fifo_start);
+		uscpi->fifo_end -= uscpi->fifo_start;
+		uscpi->fifo_start = 0;
+	}
+	for (i = 0; i < uscpi->xfer_count; i++) {
+		slot = (uscpi->xfer_head + i) % STREAM_TRANSFERS;
+		while (!uscpi->xfer_done[slot])
+			libusb_handle_events_completed(uscpi->ctx->libusb_ctx,
+				&uscpi->xfer_done[slot]);
+		transfer = uscpi->xfer[slot];
+		len = transfer->actual_length;
+		if (transfer->status == LIBUSB_TRANSFER_COMPLETED ||
+				transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+			memcpy(uscpi->fifo + uscpi->fifo_end, transfer->buffer, len);
+			uscpi->fifo_end += len;
+		}
+	}
+	uscpi->xfer_head = uscpi->xfer_count = 0;
+}
+
+/* Request the next DEV_DEP_MSG_IN message and read its header. */
+static int scpi_usbtmc_stream_begin_message(struct scpi_usbtmc_libusb *uscpi)
+{
+	int32_t message_size;
+
+	uscpi->fifo_start = uscpi->fifo_end = 0;
+	uscpi->msg_total = uscpi->msg_received = 0;
+	if (scpi_usbtmc_bulkout(uscpi, REQUEST_DEV_DEP_MSG_IN,
+	    NULL, uscpi->max_in_message, 0) < 0)
+		return SR_ERR;
+	/* An empty transfer may come first, it is skipped. */
+	if (scpi_usbtmc_stream_fill(uscpi, USBTMC_BULK_HEADER_SIZE) != SR_OK)
+		return SR_ERR;
+	if (usbtmc_bulk_in_header_read(uscpi->fifo + uscpi->fifo_start,
+			DEV_DEP_MSG_IN, uscpi->bTag, &message_size,
+			&uscpi->bulkin_attributes) != SR_OK) {
+		sr_err("USBTMC invalid bulk in header.");
+		return SR_ERR;
+	}
+	uscpi->fifo_start += USBTMC_BULK_HEADER_SIZE;
+	uscpi->msg_total = USBTMC_BULK_HEADER_SIZE + message_size;
+	uscpi->remaining_length = message_size;
+	uscpi->response_length = uscpi->response_bytes_read = 0;
+
+	return SR_OK;
+}
+
+static int scpi_usbtmc_stream_read_begin(struct scpi_usbtmc_libusb *uscpi)
+{
+	scpi_usbtmc_stream_cancel(uscpi);
+	if (scpi_usbtmc_stream_begin_message(uscpi) != SR_OK) {
+		scpi_usbtmc_stream_cancel(uscpi);
+		return SR_ERR;
+	}
+
+	return SR_OK;
+}
+
+static int scpi_usbtmc_stream_read_chunk(struct scpi_usbtmc_libusb *uscpi,
+	char *buf, int maxlen)
+{
+	int len;
+
+	if (uscpi->remaining_length <= 0) {
+		if (uscpi->bulkin_attributes & EOM)
+			return SR_ERR;
+		if (scpi_usbtmc_stream_begin_message(uscpi) != SR_OK)
+			goto fail;
+	}
+
+	/* The FIFO holds a few packets more than MAX_TRANSFER_LENGTH. */
+	len = MIN(MIN(maxlen, uscpi->remaining_length), MAX_TRANSFER_LENGTH);
+	if (scpi_usbtmc_stream_fill(uscpi, len) != SR_OK)
+		goto fail;
+	memcpy(buf, uscpi->fifo + uscpi->fifo_start, len);
+	uscpi->fifo_start += len;
+	uscpi->remaining_length -= len;
+
+	if (uscpi->remaining_length == 0) {
+		/* Whatever else came with the message is alignment. */
+		uscpi->fifo_start = uscpi->fifo_end = 0;
+		if (uscpi->xfer_count)
+			scpi_usbtmc_stream_cancel(uscpi);
+	}
+
+	return len;
+
+fail:
+	scpi_usbtmc_stream_cancel(uscpi);
+	return SR_ERR;
+}
+
 static int scpi_usbtmc_libusb_read_begin(void *priv)
 {
 	struct scpi_usbtmc_libusb *uscpi = priv;
+
+	if (uscpi->stream)
+		return scpi_usbtmc_stream_read_begin(uscpi);
 
 	uscpi->remaining_length = 0;
 
@@ -648,6 +923,9 @@ static int scpi_usbtmc_libusb_read_chunk(struct scpi_usbtmc_libusb *uscpi,
 	char *buf, int maxlen)
 {
 	int read_length;
+
+	if (uscpi->stream)
+		return scpi_usbtmc_stream_read_chunk(uscpi, buf, maxlen);
 
 	if (uscpi->response_bytes_read >= uscpi->response_length) {
 		if (uscpi->remaining_length > 0) {
@@ -686,12 +964,16 @@ static int scpi_usbtmc_libusb_read_data(void *priv, char *buf, int maxlen)
 	while (total < maxlen) {
 		len = scpi_usbtmc_libusb_read_chunk(uscpi, buf + total,
 			maxlen - total);
-		if (len < 0)
-			return total ? total : len;
+		if (len < 0) {
+			total = total ? total : len;
+			break;
+		}
 		total += len;
 		if (len == 0 || scpi_usbtmc_libusb_read_complete(uscpi))
 			break;
 	}
+	if (uscpi->stream && uscpi->xfer_count)
+		scpi_usbtmc_stream_pause(uscpi);
 
 	return total;
 }
@@ -712,6 +994,8 @@ static int scpi_usbtmc_libusb_close(struct sr_scpi_dev_inst *scpi)
 
 	if (!usb->devhdl)
 		return SR_ERR;
+
+	scpi_usbtmc_stream_free(uscpi);
 
 	scpi_usbtmc_local(uscpi);
 
