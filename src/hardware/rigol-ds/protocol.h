@@ -154,8 +154,15 @@ struct dev_context {
 	char *trigger_source;
 	float horiz_triggerpos;
 	char *trigger_slope;
-	/* DS1000Z: memory depth setting in points, 0 = AUTO (:ACQ:MDEP). */
+	/* DS1000Z: memory depth of the scope in points, 0 = AUTO (:ACQ:MDEP). */
 	uint64_t mem_depth;
+	/*
+	 * DS1000Z: memory depth chosen through SR_CONF_BUFFERSIZE, as a level
+	 * like the scope's menu (0 = AUTO, n = n-th depth, which is halved or
+	 * quartered with more channels), -1 = not chosen. Applied when an
+	 * acquisition starts, after the channels are switched.
+	 */
+	int mem_level;
 	float trigger_level;
 	/*
 	 * Trigger sweep as the scope reports it: AUTO, NORMAL, SINGLE (V1),
