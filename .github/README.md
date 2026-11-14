@@ -49,6 +49,7 @@ whole `contrib` rules set) to `/etc/udev/rules.d/` and replug the scope.
 | `scpi` | New SCPI transport `usb-vs5000` for the vendor specific USB protocol |
 | `contrib` | udev rule for USB ID 0400:03e8 |
 | `rigol-ds` | The VS5000 support itself |
+| `rigol-ds`: memory depth | 4K or 512K points for memory captures (SR_CONF_BUFFERSIZE) |
 
 **What works:**
 
@@ -61,6 +62,8 @@ whole `contrib` rules set) to `/etc/udev/rules.d/` and replug the scope.
 - Timebase, V/div, coupling, probe factor, offset, trigger source, slope,
   level and sweep. The input range that V/div and offset allow is reported
   per channel.
+- Memory depth of memory captures: 512K points at the full rate (default)
+  or 4K, the display record.
 
 **Connection strings:**
 
@@ -114,6 +117,10 @@ Example, 5 frames of the full memory over USB, as CSV:
 | `SR_CONF_TRIGGER_SWEEP` | The new config key (the same commit as on `rigol-vs5000`) |
 | `rigol-ds`: trigger sweep for V3 and later | Auto / Normal / Single for the DS2000, DS1000Z, DS4000 and MSO5000 (tested with the DS1000Z) |
 | `rigol-ds`: sample rate as meta | Send the sample rate of each capture: PulseView showed memory taken after live with the live rate |
+| `rigol-ds`: no "read should have been completed" over raw TCP | The error appeared after every block although the data was complete |
+| `rigol-ds`: input range and memory depth | Input range per channel (read-only); memory depth Auto, 12k to 24M points |
+| `rigol-ds`: memory depth as a level | The depth follows the enabled channels like on the scope and is applied when a capture starts |
+| `rigol-ds`: memory depth level from the scope | Also before a depth is chosen |
 
 **Connection strings:**
 
@@ -127,6 +134,15 @@ Example, 3 frames of the full memory of CH1, as CSV:
 
 The trigger sweep (Auto, Normal, Single) can be set like the other options,
 also in PulseView. With Single, live capture takes a new shot per frame.
+
+The memory depth (`buffersize`, 0 = Auto) works like the scope's *Mem Depth*
+menu: 12k, 120k, 1.2M, 12M or 24M points with one channel, half of that with
+two, a quarter with three or four. A chosen depth follows the enabled
+channels and is applied when a capture starts. 24M needs the memory option;
+if the scope refuses a depth, the driver warns and uses the scope's.
+
+Each channel reports its input range (`range`), the voltages that V/div and
+offset allow without clipping.
 
 A memory capture takes one single shot per frame. With the Normal or Single
 sweep it waits for a trigger; with the Auto sweep a trigger is forced when
