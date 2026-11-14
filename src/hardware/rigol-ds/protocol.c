@@ -1990,7 +1990,15 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 				sr_dev_acquisition_stop(sdi);
 				return TRUE;
 			}
-		} else if (!sr_scpi_read_complete(scpi) && !devc->channel_entry->next) {
+		} else if (scpi->transport != SCPI_TRANSPORT_RAW_TCP &&
+				!sr_scpi_read_complete(scpi) &&
+				!devc->channel_entry->next) {
+			/*
+			 * Raw TCP cannot know where a response ends (it
+			 * takes a short read as the end), and the terminating
+			 * linefeed above is read as one byte: don't complain
+			 * there.
+			 */
 			sr_err("Read should have been completed");
 		}
 		devc->num_block_read = 0;
