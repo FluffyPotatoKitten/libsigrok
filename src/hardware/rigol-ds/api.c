@@ -1435,10 +1435,11 @@ rate_done:
 	/* After the sample rate is known, outputs read it from the header. */
 	std_session_send_df_header(sdi);
 	/*
-	 * The rate depends on the timebase and the data source, a value
-	 * read before the start can be out of date.
+	 * The rate depends on the timebase and the data source, a value a
+	 * frontend read before the start can be out of date (e.g. live
+	 * before memory): send the rate of this capture.
 	 */
-	if (devc->model->series->protocol == PROTOCOL_V1 && devc->sample_rate)
+	if (devc->sample_rate > 0)
 		sr_session_send_meta(sdi, SR_CONF_SAMPLERATE,
 			g_variant_new_uint64(devc->sample_rate));
 
