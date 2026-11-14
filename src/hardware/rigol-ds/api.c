@@ -307,6 +307,7 @@ static void clear_helper(struct dev_context *devc)
 		g_free(devc->coupling[i]);
 	g_free(devc->trigger_source);
 	g_free(devc->trigger_slope);
+	g_free(devc->saved_sweep);
 	g_free(devc->analog_groups);
 }
 
@@ -984,6 +985,21 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->analog_frame_size = analog_frame_size(sdi);
 	devc->digital_frame_size = digital_frame_size(sdi);
 
+	/* Memory captures take single shots: remember what to restore. */
+	g_free(devc->saved_sweep);
+	devc->saved_sweep = NULL;
+	if (devc->data_source == DATA_SOURCE_MEMORY && protocol >= PROTOCOL_V3) {
+		char *status = NULL;
+		if (sr_scpi_get_string(scpi, ":TRIG:SWE?", &devc->saved_sweep) != SR_OK)
+			devc->saved_sweep = NULL;
+		devc->saved_running = sr_scpi_get_string(scpi, ":TRIG:STAT?",
+			&status) == SR_OK && status && status[0] != 'S';
+		g_free(status);
+		sr_dbg("Sweep %s, %s: restored after the capture.",
+			devc->saved_sweep ? devc->saved_sweep : "unknown",
+			devc->saved_running ? "running" : "stopped");
+	}
+
 	switch (devc->model->series->protocol) {
 	case PROTOCOL_V2:
 		if (rigol_ds_config_set(sdi, ":ACQ:MEMD LONG") != SR_OK)
@@ -1072,6 +1088,14 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 	devc->enabled_channels = NULL;
 	scpi = sdi->conn;
 	sr_scpi_source_remove(sdi->session, scpi);
+
+	if (devc->saved_sweep) {
+		rigol_ds_config_set(sdi, ":TRIG:SWE %s", devc->saved_sweep);
+		g_free(devc->saved_sweep);
+		devc->saved_sweep = NULL;
+		if (devc->saved_running)
+			rigol_ds_config_set(sdi, ":RUN");
+	}
 
 	return SR_OK;
 }

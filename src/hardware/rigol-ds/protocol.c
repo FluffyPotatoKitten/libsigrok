@@ -206,7 +206,54 @@ static int rigol_ds_trigger_wait(const struct sr_dev_inst *sdi)
 /* Wait for scope to got to "Stop" in single shot mode */
 static int rigol_ds_stop_wait(const struct sr_dev_inst *sdi)
 {
-	return rigol_ds_event_wait(sdi, 'S', 'S');
+	struct dev_context *devc = sdi->priv;
+	int64_t now, force_at, give_up;
+	gboolean force;
+	char *buf, c;
+
+	if (devc->data_source != DATA_SOURCE_MEMORY)
+		return rigol_ds_event_wait(sdi, 'S', 'S');
+
+	/*
+	 * Memory captures start a single shot with :SING. Until the scope
+	 * has taken the command it still reports the stop of the previous
+	 * shot (for about 100 ms on the DS1000Z), so only a stop after a
+	 * non-stop status counts (or after a second, in case the shot was
+	 * too fast to see it running).
+	 *
+	 * With the Auto sweep the user expects a waveform without a trigger,
+	 * but a single shot waits for one: force a trigger when none came
+	 * within the screen time plus a margin.
+	 */
+	force = devc->saved_sweep &&
+		!g_ascii_strncasecmp(devc->saved_sweep, "AUTO", 4);
+	force_at = devc->single_start + 300000 + (int64_t)(1e6 *
+		devc->timebase * devc->model->series->num_horizontal_divs);
+	give_up = g_get_monotonic_time() + 2000000;
+	for (;;) {
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
+			return SR_ERR;
+		c = buf[0];
+		g_free(buf);
+		now = g_get_monotonic_time();
+		if (c != 'S') {
+			devc->single_running = TRUE;
+		} else if (devc->single_running ||
+				now - devc->single_start > 1000000) {
+			rigol_ds_set_wait_event(devc, WAIT_NONE);
+			return SR_OK;
+		}
+		if (force && !devc->single_forced && now > force_at) {
+			sr_dbg("No trigger with the Auto sweep, forcing one.");
+			if (rigol_ds_config_set(sdi, ":TFOR") != SR_OK)
+				return SR_ERR;
+			devc->single_forced = TRUE;
+		}
+		if (now > give_up)
+			/* Don't block the application, try again later. */
+			return SR_ERR_TIMEOUT;
+		g_usleep(10000);
+	}
 }
 
 /* Check that a single shot acquisition actually succeeded on the DS2000 */
@@ -464,9 +511,13 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 
 			/* Memory: one new single shot per frame. Segmented reads
 			 * the recorded frames, without a new acquisition. */
-			if (devc->data_source == DATA_SOURCE_MEMORY &&
-					rigol_ds_config_set(sdi, ":SING") != SR_OK)
-				return SR_ERR;
+			if (devc->data_source == DATA_SOURCE_MEMORY) {
+				if (rigol_ds_config_set(sdi, ":SING") != SR_OK)
+					return SR_ERR;
+				devc->single_start = g_get_monotonic_time();
+				devc->single_running = FALSE;
+				devc->single_forced = FALSE;
+			}
 			rigol_ds_set_wait_event(devc, WAIT_STOP);
 			if (devc->data_source == DATA_SOURCE_SEGMENTED &&
 					devc->model->series->protocol <= PROTOCOL_V4)

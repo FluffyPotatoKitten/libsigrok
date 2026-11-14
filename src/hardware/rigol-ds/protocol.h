@@ -163,6 +163,18 @@ struct dev_context {
 	/* Acq buffers used for reading from the scope and sending data to app */
 	unsigned char *buffer;
 	float *data;
+	/*
+	 * Memory capture (V3 and later): trigger sweep and run state at the
+	 * start (a single shot sets the sweep to SINGLE and stops the scope),
+	 * restored at the end; start of the current shot, whether the scope
+	 * was seen running in it and whether a trigger was forced in it
+	 * (Auto sweep).
+	 */
+	char *saved_sweep;
+	gboolean saved_running;
+	int64_t single_start;
+	gboolean single_running;
+	gboolean single_forced;
 };
 
 SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *format, ...);
