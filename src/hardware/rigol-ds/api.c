@@ -197,6 +197,29 @@ static uint64_t ds1000z_level_depth(int level, int n)
 	return ds1000z_mem_depths[level - 1] / (n == 1 ? 1 : n == 2 ? 2 : 4);
 }
 
+/*
+ * The memory depth level. Until one is chosen it is derived from the
+ * scope's depth and the channels the scope shows, so that the depth
+ * follows the enabled channels like on the scope. -1 if the scope's depth
+ * is none of the levels.
+ */
+static int ds1000z_mem_level(const struct dev_context *devc)
+{
+	unsigned int i;
+	int level, n = 0;
+
+	if (devc->mem_level >= 0)
+		return devc->mem_level;
+	for (i = 0; i < devc->model->analog_channels; i++)
+		if (devc->analog_channels[i])
+			n++;
+	n = n ? n : 1;
+	for (level = 0; level <= (int)ARRAY_SIZE(ds1000z_mem_depths); level++)
+		if (ds1000z_level_depth(level, n) == devc->mem_depth)
+			return level;
+	return -1;
+}
+
 /* Apply the chosen memory depth, after the channels are switched. */
 static int ds1000z_apply_mem_depth(const struct sr_dev_inst *sdi)
 {
@@ -204,9 +227,10 @@ static int ds1000z_apply_mem_depth(const struct sr_dev_inst *sdi)
 	uint64_t want, got;
 	char *buf = NULL;
 
-	if (!is_ds1000z(devc) || devc->mem_level < 0)
+	if (!is_ds1000z(devc) || ds1000z_mem_level(devc) < 0)
 		return SR_OK;
-	want = ds1000z_level_depth(devc->mem_level, ds1000z_active_channels(sdi));
+	want = ds1000z_level_depth(ds1000z_mem_level(devc),
+		ds1000z_active_channels(sdi));
 	/* The scope takes a new depth only while running. */
 	if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
 		return SR_ERR;
@@ -848,8 +872,9 @@ static int config_get(uint32_t key, GVariant **data,
 			*data = g_variant_new_uint64(
 				v1_mem_depths[devc->v1_mem_normal ? 0 : 1]);
 		else if (is_ds1000z(devc))
-			*data = g_variant_new_uint64(devc->mem_level < 0 ?
-				devc->mem_depth : ds1000z_level_depth(devc->mem_level,
+			*data = g_variant_new_uint64(ds1000z_mem_level(devc) < 0 ?
+				devc->mem_depth : ds1000z_level_depth(
+					ds1000z_mem_level(devc),
 					ds1000z_active_channels(sdi)));
 		else
 			return SR_ERR_NA;
