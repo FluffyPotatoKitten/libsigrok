@@ -155,7 +155,10 @@ struct dev_context {
 	float horiz_triggerpos;
 	char *trigger_slope;
 	float trigger_level;
-	/* Trigger sweep as the scope reports it (AUTO, NORMAL, SINGLE), V1 only. */
+	/*
+	 * Trigger sweep as the scope reports it: AUTO, NORMAL, SINGLE (V1),
+	 * AUTO, NORM, SING (V3 and later).
+	 */
 	char *trigger_sweep;
 	/* Trigger type (:TRIG:MODE?, e.g. EDGE) the sweep belongs to, V1 only. */
 	char *trigger_type;

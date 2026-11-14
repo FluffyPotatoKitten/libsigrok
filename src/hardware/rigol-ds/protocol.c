@@ -2196,6 +2196,15 @@ SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
 		return SR_ERR;
 	sr_dbg("Current trigger slope %s", devc->trigger_slope);
 
+	/* Trigger sweep. */
+	g_free(devc->trigger_sweep);
+	devc->trigger_sweep = NULL;
+	if (devc->model->series->protocol >= PROTOCOL_V3) {
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:SWE?", &devc->trigger_sweep) != SR_OK)
+			return SR_ERR;
+		sr_dbg("Current trigger sweep %s", devc->trigger_sweep);
+	}
+
 	/* Trigger level. */
 	if (sr_scpi_get_float(sdi->conn, ":TRIG:EDGE:LEV?", &devc->trigger_level) != SR_OK)
 		return SR_ERR;

@@ -53,8 +53,8 @@ static const uint32_t devopts[] = {
 	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
-/* VS5000: devopts plus the trigger sweep. */
-static const uint32_t devopts_v1[] = {
+/* VS5000 and V3 and later: devopts plus the trigger sweep. */
+static const uint32_t devopts_sweep[] = {
 	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET,
 	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
@@ -170,7 +170,7 @@ static const char *trigger_slopes[] = {
 	"r", "f",
 };
 
-/* VS5000 trigger sweeps, and how the scope names them. */
+/* Trigger sweeps, and how the scope names them (V3 and later answer NORM, SING). */
 static const char *trigger_sweeps[] = {
 	"Auto", "Normal", "Single",
 };
@@ -698,6 +698,19 @@ static int config_get(uint32_t key, GVariant **data,
 		}
 		*data = g_variant_new_string(tmp_str);
 		break;
+	case SR_CONF_TRIGGER_SWEEP:
+		if (!devc->trigger_sweep)
+			return SR_ERR_NA;
+		for (i = 0; i < ARRAY_SIZE(trigger_sweeps); i++)
+			if (!g_ascii_strncasecmp(devc->trigger_sweep,
+					trigger_sweeps_scpi[i], 4))
+				break;
+		if (i == ARRAY_SIZE(trigger_sweeps)) {
+			sr_dbg("Unknown trigger sweep: '%s'.", devc->trigger_sweep);
+			return SR_ERR_NA;
+		}
+		*data = g_variant_new_string(trigger_sweeps[i]);
+		break;
 	case SR_CONF_TRIGGER_SLOPE:
 		if (!strncmp(devc->trigger_slope, "POS", 3)) {
 			tmp_str = "r";
@@ -711,19 +724,6 @@ static int config_get(uint32_t key, GVariant **data,
 		break;
 	case SR_CONF_TRIGGER_LEVEL:
 		*data = g_variant_new_double(devc->trigger_level);
-		break;
-	case SR_CONF_TRIGGER_SWEEP:
-		if (!devc->trigger_sweep)
-			return SR_ERR_NA;
-		for (i = 0; i < ARRAY_SIZE(trigger_sweeps); i++)
-			if (!g_ascii_strcasecmp(devc->trigger_sweep,
-					trigger_sweeps_scpi[i]))
-				break;
-		if (i == ARRAY_SIZE(trigger_sweeps)) {
-			sr_dbg("Unknown trigger sweep: '%s'.", devc->trigger_sweep);
-			return SR_ERR_NA;
-		}
-		*data = g_variant_new_string(trigger_sweeps[i]);
 		break;
 	case SR_CONF_TIMEBASE:
 		for (i = 0; i < devc->num_timebases; i++) {
@@ -888,11 +888,22 @@ static int config_set(uint32_t key, GVariant *data,
 			devc->trigger_level = t_dbl;
 		return ret;
 	case SR_CONF_TRIGGER_SWEEP:
+		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(trigger_sweeps))) < 0)
+			return SR_ERR_ARG;
+		if (devc->model->series->protocol >= PROTOCOL_V3) {
+			ret = rigol_ds_config_set(sdi, ":TRIG:SWE %s",
+				trigger_sweeps_scpi[idx]);
+			if (ret != SR_OK)
+				return ret;
+			g_free(devc->trigger_sweep);
+			devc->trigger_sweep = g_strdup(trigger_sweeps_scpi[idx]);
+			/* Live capture with SINGLE takes a new shot per frame. */
+			devc->live_single = idx == 2;
+			return SR_OK;
+		}
 		if (devc->model->series->protocol != PROTOCOL_V1 ||
 				!devc->trigger_type)
 			return SR_ERR_NA;
-		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(trigger_sweeps))) < 0)
-			return SR_ERR_ARG;
 		/*
 		 * Only commands, no queries: this may run in another thread
 		 * while a waveform reply is being read, and over LAN a query
@@ -1039,8 +1050,9 @@ static int config_list(uint32_t key, GVariant **data,
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
-		if (!cg && devc && devc->model->series->protocol == PROTOCOL_V1)
-			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_v1);
+		if (!cg && devc && (devc->model->series->protocol == PROTOCOL_V1 ||
+				devc->model->series->protocol >= PROTOCOL_V3))
+			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_sweep);
 		if (!cg)
 			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
 		if (!devc)
@@ -1099,11 +1111,11 @@ static int config_list(uint32_t key, GVariant **data,
 			return SR_ERR_ARG;
 		*data = g_variant_new_strv(devc->model->trigger_sources, devc->model->num_trigger_sources);
 		break;
-	case SR_CONF_TRIGGER_SLOPE:
-		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_slopes));
-		break;
 	case SR_CONF_TRIGGER_SWEEP:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_sweeps));
+		break;
+	case SR_CONF_TRIGGER_SLOPE:
+		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_slopes));
 		break;
 	case SR_CONF_DATA_SOURCE:
 		if (!devc)
