@@ -1133,6 +1133,7 @@ SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
 		if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
 			return SR_ERR;
 		devc->mem_depth = g_ascii_strtoull(buf, NULL, 10);
+		devc->mem_level = -1;
 		sr_dbg("Current memory depth %s", buf);
 		g_free(buf);
 	}
