@@ -43,6 +43,8 @@ struct scpi_usbtmc_libusb {
 	uint8_t bTag;
 	uint8_t bulkin_attributes;
 	uint8_t buffer[MAX_TRANSFER_LENGTH];
+	uint16_t bulk_in_max_packet;
+	int32_t max_in_message;
 	int response_length;
 	int response_bytes_read;
 	int remaining_length;
@@ -338,6 +340,7 @@ static int scpi_usbtmc_libusb_open(struct sr_scpi_dev_inst *scpi)
 				if (ep->bmAttributes == LIBUSB_TRANSFER_TYPE_BULK &&
 				    ep->bEndpointAddress & (LIBUSB_ENDPOINT_DIR_MASK)) {
 					uscpi->bulk_in_ep = ep->bEndpointAddress;
+					uscpi->bulk_in_max_packet = ep->wMaxPacketSize & 0x7ff;
 					sr_dbg("Bulk IN EP %d", uscpi->bulk_in_ep & 0x7f);
 				}
 				if (ep->bmAttributes == LIBUSB_TRANSFER_TYPE_INTERRUPT &&
@@ -356,6 +359,23 @@ static int scpi_usbtmc_libusb_open(struct sr_scpi_dev_inst *scpi)
 	if (!found) {
 		sr_err("Failed to find USBTMC interface.");
 		return SR_ERR;
+	}
+
+	/*
+	 * Some devices (e.g. the Rigol DS1000Z series) declare 64 byte bulk
+	 * endpoints also at high speed, where bulk endpoints must have 512
+	 * bytes. Such a device sends stale buffer contents when a
+	 * DEV_DEP_MSG_IN message is longer than one 512 byte packet, without
+	 * any error. Ask for at most one packet's worth of data per message
+	 * (header included).
+	 */
+	uscpi->max_in_message = INT32_MAX;
+	if (libusb_get_device_speed(dev) == LIBUSB_SPEED_HIGH &&
+	    uscpi->bulk_in_max_packet < 512) {
+		uscpi->max_in_message = 512 - USBTMC_BULK_HEADER_SIZE;
+		sr_info("Bulk IN EP has a max packet size of %d bytes at high "
+			"speed (must be 512); limiting messages to %d bytes.",
+			uscpi->bulk_in_max_packet, uscpi->max_in_message);
 	}
 
 	if (libusb_kernel_driver_active(usb->devhdl, uscpi->interface) == 1) {
@@ -611,7 +631,7 @@ static int scpi_usbtmc_libusb_read_begin(void *priv)
 	uscpi->remaining_length = 0;
 
 	if (scpi_usbtmc_bulkout(uscpi, REQUEST_DEV_DEP_MSG_IN,
-	    NULL, INT32_MAX, 0) < 0)
+	    NULL, uscpi->max_in_message, 0) < 0)
 		return SR_ERR;
 	if (scpi_usbtmc_bulkin_start(uscpi, DEV_DEP_MSG_IN,
 	                             uscpi->buffer, sizeof(uscpi->buffer),
