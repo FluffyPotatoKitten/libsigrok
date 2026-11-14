@@ -2204,6 +2204,16 @@ SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
 		return SR_ERR;
 	sr_dbg("Current trigger slope %s", devc->trigger_slope);
 
+	/* Memory depth (DS1000Z). */
+	if (!strcmp(devc->model->series->name, "DS1000Z")) {
+		char *buf;
+		if (sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf) != SR_OK)
+			return SR_ERR;
+		devc->mem_depth = g_ascii_strtoull(buf, NULL, 10);
+		sr_dbg("Current memory depth %s", buf);
+		g_free(buf);
+	}
+
 	/* Trigger sweep. */
 	g_free(devc->trigger_sweep);
 	devc->trigger_sweep = NULL;

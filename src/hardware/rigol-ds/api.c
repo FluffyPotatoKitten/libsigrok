@@ -53,8 +53,8 @@ static const uint32_t devopts[] = {
 	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
-/* VS5000 and V3 and later: devopts plus the trigger sweep. */
-static const uint32_t devopts_sweep[] = {
+/* VS5000: devopts plus the trigger sweep and the memory depth. */
+static const uint32_t devopts_v1[] = {
 	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET,
 	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
@@ -65,6 +65,20 @@ static const uint32_t devopts_sweep[] = {
 	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_BUFFERSIZE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+};
+
+/* V3 and later: devopts plus the trigger sweep. */
+static const uint32_t devopts_sweep[] = {
+	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_NUM_HDIV | SR_CONF_GET,
+	SR_CONF_HORIZ_TRIGGERPOS | SR_CONF_SET,
+	SR_CONF_TRIGGER_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
@@ -91,6 +105,72 @@ static const uint32_t devopts_cg_analog_v1[] = {
 	SR_CONF_OFFSET | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_RANGE | SR_CONF_GET,
 };
+
+/* DS1000Z: devopts_v3 plus the memory depth. */
+static const uint32_t devopts_ds1000z[] = {
+	SR_CONF_LIMIT_FRAMES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_SAMPLERATE | SR_CONF_GET,
+	SR_CONF_TIMEBASE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_NUM_HDIV | SR_CONF_GET,
+	SR_CONF_HORIZ_TRIGGERPOS | SR_CONF_SET,
+	SR_CONF_TRIGGER_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_TRIGGER_SWEEP | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_BUFFERSIZE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+};
+
+/* DS1000Z: per channel also the input range given by V/div and offset. */
+static const uint32_t devopts_cg_analog_ds1000z[] = {
+	SR_CONF_NUM_VDIV | SR_CONF_GET,
+	SR_CONF_VDIV | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_COUPLING | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_PROBE_FACTOR | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_OFFSET | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_RANGE | SR_CONF_GET,
+};
+
+/*
+ * DS1000Z memory depths in points with one active channel; halved with
+ * two, quartered with three or four. 24M needs the memory option (the
+ * scope rejects it otherwise).
+ */
+static const uint64_t ds1000z_mem_depths[] = {
+	12000, 120000, 1200000, 12000000, 24000000,
+};
+
+static gboolean is_ds1000z(const struct dev_context *devc)
+{
+	return devc && !strcmp(devc->model->series->name, "DS1000Z");
+}
+
+/*
+ * DS1000Z input range of a channel: the BYTE samples are 25 codes per
+ * division, (code - 127) * V/div / 25 - offset, codes 0 to 255.
+ */
+static char *ds1000z_range_string(const struct dev_context *devc, int ch)
+{
+	double inc = devc->vdiv[ch] / 25.0;
+	double low = -127 * inc - devc->vert_offset[ch];
+	double high = 128 * inc - devc->vert_offset[ch];
+
+	if (fabs(low) < 1.0 && fabs(high) < 1.0)
+		return g_strdup_printf("%+.1f mV .. %+.1f mV", low * 1000, high * 1000);
+	return g_strdup_printf("%+.2f V .. %+.2f V", low, high);
+}
+
+/* Active channels as the scope counts them for the memory depth. */
+static int ds1000z_active_channels(const struct dev_context *devc)
+{
+	unsigned int i;
+	int n = 0;
+
+	for (i = 0; i < devc->model->analog_channels; i++)
+		if (devc->analog_channels[i])
+			n++;
+	return n ? n : 1;
+}
 
 static const uint64_t timebases[][2] = {
 	/* nanoseconds */
@@ -705,6 +785,15 @@ static int config_get(uint32_t key, GVariant **data,
 		}
 		*data = g_variant_new_string(tmp_str);
 		break;
+	case SR_CONF_BUFFERSIZE:
+		if (devc->model->series->protocol == PROTOCOL_V1)
+			*data = g_variant_new_uint64(
+				v1_mem_depths[devc->v1_mem_normal ? 0 : 1]);
+		else if (is_ds1000z(devc))
+			*data = g_variant_new_uint64(devc->mem_depth);
+		else
+			return SR_ERR_NA;
+		break;
 	case SR_CONF_TRIGGER_SWEEP:
 		if (!devc->trigger_sweep)
 			return SR_ERR_NA;
@@ -731,11 +820,6 @@ static int config_get(uint32_t key, GVariant **data,
 		break;
 	case SR_CONF_TRIGGER_LEVEL:
 		*data = g_variant_new_double(devc->trigger_level);
-		break;
-	case SR_CONF_BUFFERSIZE:
-		if (devc->model->series->protocol != PROTOCOL_V1)
-			return SR_ERR_NA;
-		*data = g_variant_new_uint64(v1_mem_depths[devc->v1_mem_normal ? 0 : 1]);
 		break;
 	case SR_CONF_TIMEBASE:
 		for (i = 0; i < devc->num_timebases; i++) {
@@ -803,12 +887,17 @@ static int config_get(uint32_t key, GVariant **data,
 		*data = g_variant_new_uint64(devc->attenuation[analog_channel]);
 		break;
 	case SR_CONF_RANGE:
-		/* VS5000: input voltages that do not clip, as text. */
-		if (analog_channel < 0 ||
-				devc->model->series->protocol != PROTOCOL_V1)
+		/* Input voltages that do not clip, as text. */
+		if (analog_channel < 0)
 			return SR_ERR_NA;
-		*data = g_variant_new_take_string(
-			rigol_ds_v1_range_string(devc, analog_channel));
+		if (devc->model->series->protocol == PROTOCOL_V1)
+			*data = g_variant_new_take_string(
+				rigol_ds_v1_range_string(devc, analog_channel));
+		else if (is_ds1000z(devc))
+			*data = g_variant_new_take_string(
+				ds1000z_range_string(devc, analog_channel));
+		else
+			return SR_ERR_NA;
 		break;
 	case SR_CONF_OFFSET:
 		/*
@@ -899,14 +988,46 @@ static int config_set(uint32_t key, GVariant *data,
 		if (ret == SR_OK)
 			devc->trigger_level = t_dbl;
 		return ret;
-	case SR_CONF_BUFFERSIZE:
-		if (devc->model->series->protocol != PROTOCOL_V1)
+	case SR_CONF_BUFFERSIZE: {
+		uint64_t depth = g_variant_get_uint64(data), got;
+		char *buf = NULL;
+		gboolean stopped;
+		if (devc->model->series->protocol == PROTOCOL_V1) {
+			if ((idx = std_u64_idx(data, ARRAY_AND_SIZE(v1_mem_depths))) < 0)
+				return SR_ERR_ARG;
+			/* Sent when a memory capture starts. */
+			devc->v1_mem_normal = idx == 0;
+			return SR_OK;
+		}
+		if (!is_ds1000z(devc))
 			return SR_ERR_NA;
-		if ((idx = std_u64_idx(data, ARRAY_AND_SIZE(v1_mem_depths))) < 0)
+		/* The scope takes a new depth only while running. */
+		if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
+			return SR_ERR;
+		stopped = buf && buf[0] == 'S';
+		g_free(buf);
+		if (stopped && rigol_ds_config_set(sdi, ":RUN") != SR_OK)
+			return SR_ERR;
+		if (depth)
+			ret = rigol_ds_config_set(sdi, ":ACQ:MDEP %" PRIu64, depth);
+		else
+			ret = rigol_ds_config_set(sdi, ":ACQ:MDEP AUTO");
+		if (ret == SR_OK)
+			ret = sr_scpi_get_string(sdi->conn, ":ACQ:MDEP?", &buf);
+		if (stopped)
+			rigol_ds_config_set(sdi, ":STOP");
+		if (ret != SR_OK)
+			return SR_ERR;
+		got = g_ascii_strtoull(buf, NULL, 10);
+		g_free(buf);
+		devc->mem_depth = got;
+		if (got != depth) {
+			sr_err("Memory depth %" PRIu64 " not accepted (24M needs "
+				"the memory option and one channel).", depth);
 			return SR_ERR_ARG;
-		/* Sent when a memory capture starts. */
-		devc->v1_mem_normal = idx == 0;
+		}
 		return SR_OK;
+	}
 	case SR_CONF_TRIGGER_SWEEP:
 		if ((idx = std_str_idx(data, ARRAY_AND_SIZE(trigger_sweeps))) < 0)
 			return SR_ERR_ARG;
@@ -1070,8 +1191,11 @@ static int config_list(uint32_t key, GVariant **data,
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
-		if (!cg && devc && (devc->model->series->protocol == PROTOCOL_V1 ||
-				devc->model->series->protocol >= PROTOCOL_V3))
+		if (!cg && is_ds1000z(devc))
+			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_ds1000z);
+		if (!cg && devc && devc->model->series->protocol == PROTOCOL_V1)
+			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_v1);
+		if (!cg && devc && devc->model->series->protocol >= PROTOCOL_V3)
 			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts_sweep);
 		if (!cg)
 			return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
@@ -1085,6 +1209,8 @@ static int config_list(uint32_t key, GVariant **data,
 				return SR_ERR_ARG;
 			if (devc->model->series->protocol == PROTOCOL_V1)
 				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog_v1));
+			else if (is_ds1000z(devc))
+				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog_ds1000z));
 			else
 				*data = std_gvar_array_u32(ARRAY_AND_SIZE(devopts_cg_analog));
 			return SR_OK;
@@ -1131,11 +1257,24 @@ static int config_list(uint32_t key, GVariant **data,
 			return SR_ERR_ARG;
 		*data = g_variant_new_strv(devc->model->trigger_sources, devc->model->num_trigger_sources);
 		break;
-	case SR_CONF_BUFFERSIZE:
-		if (!devc || devc->model->series->protocol != PROTOCOL_V1)
+	case SR_CONF_BUFFERSIZE: {
+		if (devc && devc->model->series->protocol == PROTOCOL_V1) {
+			*data = std_gvar_array_u64(ARRAY_AND_SIZE(v1_mem_depths));
+			break;
+		}
+		if (!is_ds1000z(devc))
 			return SR_ERR_NA;
-		*data = std_gvar_array_u64(ARRAY_AND_SIZE(v1_mem_depths));
+		uint64_t depths[1 + ARRAY_SIZE(ds1000z_mem_depths)];
+		int n, div;
+		unsigned int k;
+		n = ds1000z_active_channels(devc);
+		div = n == 1 ? 1 : n == 2 ? 2 : 4;
+		depths[0] = 0;		/* AUTO */
+		for (k = 0; k < ARRAY_SIZE(ds1000z_mem_depths); k++)
+			depths[k + 1] = ds1000z_mem_depths[k] / div;
+		*data = std_gvar_array_u64(depths, ARRAY_SIZE(depths));
 		break;
+	}
 	case SR_CONF_TRIGGER_SWEEP:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_sweeps));
 		break;
