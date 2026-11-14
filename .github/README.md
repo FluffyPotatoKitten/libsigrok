@@ -84,4 +84,4 @@ for the trigger sweep, offset and input range controls.
 
 ## License
 
-GPL-3.0-or-later, like upstream libsigrok.
+GPL-3.0 or later.
